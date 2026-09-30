@@ -1,0 +1,8 @@
+# Naturalizer run logs
+*.log
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
