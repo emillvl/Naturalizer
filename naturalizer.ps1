@@ -33,9 +33,9 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
-# ─────────────────────────────────────────────────────────────────────────────
+
 # BANNER & INIT
-# ─────────────────────────────────────────────────────────────────────────────
+
 $banner = @'
         _   __      __                   ___                
    / | / /___ _/ /___  ___________ _/ (_)___  ___  _____
@@ -45,9 +45,9 @@ $banner = @'
                       v 1.0.0                                  
 '@
 if (-not $Watchdog) { Write-Host $banner -ForegroundColor Red }
-# ─────────────────────────────────────────────────────────────────────────────
+
 # LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
+
 $LogFile = "$PSScriptRoot\Naturalizer_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
 function Write-Log {
     param(
@@ -69,9 +69,9 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $entry -ErrorAction SilentlyContinue
 }
 Write-Log "Naturalizer initialized. Log: $LogFile" HEAD -SilentConsole
-# ─────────────────────────────────────────────────────────────────────────────
+
 # RESTORE POINT
-# ─────────────────────────────────────────────────────────────────────────────
+
 if (-not $SkipRestorePoint -and -not $Watchdog) {
     Write-Host "[*] Creating System Restore Point... " -NoNewline -ForegroundColor Cyan
     try {
@@ -84,9 +84,9 @@ if (-not $SkipRestorePoint -and -not $Watchdog) {
         Write-Host "[SKIPPED/FAILED]" -ForegroundColor Yellow
     }
 }
-# =============================================================================
+
 # HELPER: SERVICES
-# =============================================================================
+
 function Disable-NaturalizerService {
     param([string]$Name, [string]$Why)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -121,9 +121,9 @@ function Disable-UserTemplateService {
         Write-Log "    OK Template disabled (registry): $Prefix -> Start=4" -SilentConsole
     }
 }
-# =============================================================================
+
 # PHASE 1 & 2 — SERVICES
-# =============================================================================
+
 if (-not $Watchdog) { Write-Host "`n[*] Silently disabling pure-spy services... " -NoNewline -ForegroundColor Cyan }
 Write-Log "  -- Pure-spy services (no local function; always killed) --" -SilentConsole
 Disable-NaturalizerService 'DiagTrack' 'Connected User Experiences & Telemetry'
@@ -153,7 +153,7 @@ function Invoke-DualNatureGroup {
         Write-Log "     -> Kept ALIVE by user choice." WARN -SilentConsole
     }
 }
-# ── DUAL-NATURE INTERACTIVE ──────────────────────────────────────────────────
+#  DUAL-NATURE INTERACTIVE 
 Invoke-DualNatureGroup -ServiceNames @('lfsvc') -Label 'Geolocation Service' `
     -RealFunction 'Weather app accuracy, Maps "find me," Find My Device, auto time zone.' `
     -BreaksIfKilled 'Location apps fall back to coarse IP. Find My Device fails.' `
@@ -198,7 +198,7 @@ Invoke-DualNatureGroup -ServiceNames @('EventLog') -Label 'Windows Event Log (HI
     -RealFunction 'Core Windows event logging infrastructure used by Windows, applications, diagnostics, auditing, and troubleshooting.' `
     -BreaksIfKilled 'Windows and applications can lose event logging/auditing; diagnostics and components that depend on Event Log may malfunction.' `
     -SpyAngle 'Stores local event records that diagnostic or telemetry components may read; EventLog itself is not inherently a telemetry-upload service.'
-# ── OPTIONAL DEFENDER CLOUD PROTECTION ────────────────────────────────────────
+# ── OPTIONAL DEFENDER CLOUD PROTECTION
 if (-not $Watchdog) {
     Write-Host "`n  ----- Microsoft Defender Cloud Protection -----" -ForegroundColor White
     Write-Host "     Real function    : Cloud verdicts for suspicious/unknown files and Block at First Sight." -ForegroundColor Gray
@@ -228,9 +228,71 @@ if (-not $Watchdog) {
         Write-Log "  Defender cloud protection kept ALIVE by user choice." WARN -SilentConsole
     }
 }
-# =============================================================================
+
+# OPTIONAL SMART APP CONTROL 
+if (-not $Watchdog) {
+    Write-Host "`n  ----- Windows Smart App Control -----" -ForegroundColor White
+    Write-Host "     Real function    : Blocks untrusted, unsigned, or potentially malicious applications." -ForegroundColor Gray
+    Write-Host "     Breaks if killed : Removes Smart App Control's application execution protection." -ForegroundColor Gray
+    Write-Host "     Privacy angle    : Uses cloud-based reputation intelligence to evaluate applications." -ForegroundColor DarkRed
+
+    $sacPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
+    $sacName = 'VerifiedAndReputablePolicyState'
+    $ciTool  = Join-Path $env:SystemRoot 'System32\CiTool.exe'
+
+    $sacState = Get-ItemPropertyValue -Path $sacPath `
+        -Name $sacName -ErrorAction SilentlyContinue
+
+    if ($null -eq $sacState) {
+        Write-Log "  [SKIP] Smart App Control state not found." WARN -SilentConsole
+    }
+    elseif ($sacState -eq 0) {
+        Write-Log "  Smart App Control already disabled." -SilentConsole
+    }
+    else {
+        $resp = (Read-Host "     Disable Smart App Control? [y/N]").Trim()
+
+        if ($resp -match '^[Yy]$') {
+            Write-Log " OPTIONAL — SMART APP CONTROL" HEAD -SilentConsole
+
+            try {
+                if (-not (Test-Path -LiteralPath $ciTool)) {
+                    throw "CiTool.exe is unavailable on this Windows installation."
+                }
+
+                Set-ItemProperty -Path $sacPath `
+                    -Name $sacName `
+                    -Value 0 `
+                    -Type DWord `
+                    -ErrorAction Stop
+
+                & $ciTool -r | Out-Null
+
+                if ($LASTEXITCODE -ne 0) {
+                    throw "CiTool policy refresh failed with exit code $LASTEXITCODE."
+                }
+
+                $verified = Get-ItemPropertyValue -Path $sacPath `
+                    -Name $sacName -ErrorAction Stop
+
+                if ($verified -ne 0) {
+                    throw "Smart App Control registry verification failed."
+                }
+
+                Write-Log "  Smart App Control disabled; policy refresh completed." -SilentConsole
+            }
+            catch {
+                Write-Log "  Smart App Control configuration failed: $_" WARN -SilentConsole
+            }
+        }
+        else {
+            Write-Log "  Smart App Control preserved by user choice." -SilentConsole
+        }
+    }
+}
+
 # PHASE 3 — SCHEDULED TASKS
-# =============================================================================
+
 if (-not $Watchdog) { Write-Host "`n[*] Disabling scheduled tasks... " -NoNewline -ForegroundColor Cyan }
 Write-Log " PHASE 3 — SCHEDULED TASKS" HEAD -SilentConsole
 function Disable-NaturalizerTask {
@@ -274,9 +336,9 @@ $tasks = @(
 )
 foreach ($t in $tasks) { Disable-NaturalizerTask -Path $t[0] -Name $t[1] }
 if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
-# =============================================================================
+
 # PHASE 3B — WMI / DEVICE MANAGEMENT DIAGNOSTIC SUBSCRIPTIONS
-# =============================================================================
+
 if (-not $Watchdog) { Write-Host "[*] Removing diagnostic WMI subscriptions... " -NoNewline -ForegroundColor Cyan }
 Write-Log " PHASE 3B — WMI DIAGNOSTIC SUBSCRIPTIONS" HEAD -SilentConsole
 function Remove-DiagnosticWmiSubscriptions {
@@ -325,9 +387,9 @@ function Remove-DiagnosticWmiSubscriptions {
 }
 Remove-DiagnosticWmiSubscriptions
 if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
-# =============================================================================
+
 # PHASE 4 — REGISTRY POLICIES
-# =============================================================================
+
 if (-not $Watchdog) { Write-Host "[*] Applying registry policies... " -NoNewline -ForegroundColor Cyan }
 Write-Log " PHASE 4 — REGISTRY POLICIES" HEAD -SilentConsole
 function Set-Reg {
@@ -395,9 +457,9 @@ Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' 'DODown
 Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
 Set-Reg 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
 if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
-# =============================================================================
+
 # PHASE 5 — ETW AUTOLOGGER SESSIONS
-# =============================================================================
+
 if (-not $Watchdog) { Write-Host "[*] Disabling ETW AutoLogger sessions... " -NoNewline -ForegroundColor Cyan }
 Write-Log " PHASE 5 — ETW AUTOLOGGER SESSIONS" HEAD -SilentConsole
 function Disable-AutoLogger {
@@ -411,9 +473,9 @@ function Disable-AutoLogger {
         Write-Log "  OK AutoLogger disabled: $SessionName" -SilentConsole
     }
 }
-# =============================================================================
+
 # OPTIONAL — EXISTING WINDOWS EVENT LOG CLEARDOWN
-# =============================================================================
+
 if (-not $Watchdog) {
     Write-Host "`n  ----- Existing Windows Event Logs (DESTRUCTIVE) -----" -ForegroundColor White
     Write-Host "     Targets : Existing Windows Event Viewer logs accessible through wevtutil." -ForegroundColor Gray
@@ -456,9 +518,9 @@ Disable-AutoLogger 'SQMLogger'
 Disable-AutoLogger 'DiagLog'
 Disable-AutoLogger 'NOISY'
 if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
-# =============================================================================
+
 # OPTIONAL — DIAGNOSTIC LOG PERSISTENCE CLEARDOWN
-# =============================================================================
+
 if (-not $Watchdog) {
     Write-Host "`n  ----- Existing Diagnostic Logs -----" -ForegroundColor White
     Write-Host "     Targets          : C:\ProgramData\Microsoft\Diagnosis\ and C:\Windows\System32\wsqm\ " -ForegroundColor Gray
@@ -486,9 +548,9 @@ if (-not $Watchdog) {
         Write-Log "  Existing diagnostic logs kept by user choice." WARN -SilentConsole
     }
 }
-# =============================================================================
+
 # PHASE 6 & 7 — FIREWALL & HOSTS
-# =============================================================================
+
 if ($BlockFirewall) {
     if (-not $Watchdog) { Write-Host "[*] Applying Firewall outbound blocks... " -NoNewline -ForegroundColor Cyan }
     Write-Log " PHASE 6 — FIREWALL BLOCKS" HEAD -SilentConsole
@@ -539,9 +601,9 @@ if ($BlockHosts) {
     }
     if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
 }
-# =============================================================================
+
 # PHASE 8 — BOOT-START WATCHDOG SETUP (Dual-Trigger)
-# =============================================================================
+
 if (-not $Watchdog) {
     Write-Host "[*] Setting up boot-start watchdog... " -NoNewline -ForegroundColor Cyan
     Write-Log " PHASE 8 — BOOT-START WATCHDOG" HEAD -SilentConsole
