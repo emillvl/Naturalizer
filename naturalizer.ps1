@@ -222,22 +222,69 @@ $LogFile = Join-Path $InstallDirectory "Naturalizer_${runMode}_${runStamp}_${run
 function Write-Log {
     param(
         [string]$Message,
-        [ValidateSet('INFO', 'WARN', 'ERROR', 'HEAD')]
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'HEAD', 'OK')]
         [string]$Level = 'INFO',
         [switch]$SilentConsole
     )
 
     $entry = "[$(Get-Date -Format 'HH:mm:ss')][$runMode][$Level] $Message"
     if (-not $Watchdog -and -not $SilentConsole) {
-        $color = switch ($Level) {
-            'HEAD'  { 'White' }
-            'WARN'  { 'Yellow' }
-            'ERROR' { 'Red' }
-            default { 'Gray' }
+        $marker, $color = switch ($Level) {
+            'HEAD'  { '[*]', 'Cyan' }
+            'OK'    { '[+]', 'Green' }
+            'WARN'  { '[!]', 'Yellow' }
+            'ERROR' { '[x]', 'Red' }
+            default { '[*]', 'Gray' }
         }
-        Write-Host $Message -ForegroundColor $color
+        Write-Host "$marker $Message" -ForegroundColor $color
     }
     Add-Content -LiteralPath $LogFile -Value $entry -Encoding UTF8 -ErrorAction Stop
+}
+
+function Write-NaturalizerSection {
+    param([string]$Title)
+
+    Write-Host "`n  ----- $Title -----" -ForegroundColor White
+}
+
+function Write-NaturalizerRow {
+    param([string]$Label, [string]$Message, [ConsoleColor]$Color = 'Gray')
+
+    $width = 96
+    try {
+        $width = [Math]::Min($width, [Math]::Max(40, $Host.UI.RawUI.WindowSize.Width - 1))
+    }
+    catch {
+        # Hosts without a console still use the default width.
+    }
+
+    $prefix = '     {0,-20} ' -f $Label
+    $indent = ' ' * $prefix.Length
+    $line = $prefix
+    foreach ($word in ($Message -split '\s+')) {
+        if ($line.Length -gt $prefix.Length -and $line.Length + $word.Length -gt $width) {
+            Write-Host $line.TrimEnd() -ForegroundColor $Color
+            $line = $indent
+        }
+        $line += "$word "
+    }
+    Write-Host $line.TrimEnd() -ForegroundColor $Color
+}
+
+function Read-NaturalizerChoice {
+    param([string]$Prompt, [string[]]$Choices)
+
+    while ($true) {
+        $answer = Read-Host "     [?] $Prompt"
+        if ($null -eq $answer) {
+            throw 'Input closed before the optional service choice was answered.'
+        }
+        $choice = $answer.Trim().ToUpperInvariant()
+        if ($choice -in $Choices) {
+            return $choice
+        }
+        Write-Host "     [!] Enter $($Choices -join ' or ')." -ForegroundColor Yellow
+    }
 }
 
 function Invoke-NaturalizerNative {
@@ -269,7 +316,18 @@ function Set-VerifiedRegistryValue {
     }
 }
 
-Write-Log 'Naturalizer 1.5.1' HEAD
+if (-not $Watchdog) {
+    $banner = @'
+        _   __      __                   ___
+   / | / /___ _/ /___  ___________ _/ (_)___  ___  _____
+  /  |/ / __ `/ __/ / / / ___/ __ `/ / /_  / / _ \/ ___/
+ / /|  / /_/ / /_/ /_/ / /  / /_/ / / / / /_/  __/ /
+/_/ |_/\__,_/\__/\__,_/_/   \__,_/_/_/ /___/\___/_/
+                      v 1.5.1
+'@
+    Write-Host $banner -ForegroundColor Red
+}
+Write-Log 'Naturalizer 1.5.1' HEAD -SilentConsole
 Write-Log "Installed script path: $InstalledScript" -SilentConsole
 Write-Log "Log file: $LogFile" -SilentConsole
 
@@ -475,7 +533,7 @@ function Install-NaturalizerWatchdog {
         }
     }
 
-    Write-Log "Verified registration of $taskName. Task execution can be checked in Task Scheduler or the watchdog log."
+    Write-Log "Verified registration of $taskName. Task execution can be checked in Task Scheduler or the watchdog log." OK
 }
 
 if (-not $Watchdog) {
@@ -498,7 +556,7 @@ if (-not $SkipRestorePoint -and -not $Watchdog) {
         if (-not $point) {
             throw 'Windows did not report a new restore point.'
         }
-        Write-Log 'Restore point created.'
+        Write-Log 'Restore point created.' OK
     }
     catch {
         Write-Log "Could not create a restore point: $_" WARN
@@ -555,7 +613,7 @@ function Stop-NaturalizerService {
 }
 
 function Disable-NaturalizerService {
-    param([string]$Name, [string]$Description)
+    param([string]$Name, [string]$Description, [switch]$Report)
 
     $service = Get-NaturalizerService $Name
     if ($null -eq $service -or (Get-NaturalizerServiceState $service) -in @('Disabled', 'Unknown')) {
@@ -569,7 +627,7 @@ function Disable-NaturalizerService {
             if ($updated.StartType -ne 'Disabled') {
                 throw 'The service manager did not report a disabled startup type.'
             }
-            Write-Log "Disabled service $Name ($Description)." -SilentConsole
+            Write-Log "Disabled service $Name ($Description)." OK -SilentConsole:(-not $Report)
         }
         catch {
             Write-Log "Could not disable service $Name. $_" WARN
@@ -602,6 +660,7 @@ function Get-NaturalizerOptionalServiceState {
     param([hashtable]$Group)
 
     $disabled = @()
+    $disabledServices = @()
     $unavailable = @()
     $pendingServices = @(foreach ($name in $Group['Services']) {
         $service = Get-NaturalizerService $name
@@ -612,6 +671,7 @@ function Get-NaturalizerOptionalServiceState {
         }
         if ($state -in @('Disabled', 'StopOnly')) {
             $disabled += $name
+            $disabledServices += $name
         }
         if ($state -ne 'Disabled') {
             $name
@@ -621,6 +681,7 @@ function Get-NaturalizerOptionalServiceState {
     $prefix = $Group['UserTemplatePrefix']
     $templatePath = $null
     $templatePending = $false
+    $templateDisabled = $false
     $instances = @()
     if ($prefix) {
         $templatePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$prefix"
@@ -629,8 +690,9 @@ function Get-NaturalizerOptionalServiceState {
             if ($start -isnot [int]) {
                 throw 'The template Start value was unavailable or had an unexpected type.'
             }
-            $templatePending = $start -ne 4
-            if (-not $templatePending) {
+            $templateDisabled = $start -eq 4
+            $templatePending = -not $templateDisabled
+            if ($templateDisabled) {
                 $disabled += "$prefix template"
             }
         }
@@ -661,11 +723,78 @@ function Get-NaturalizerOptionalServiceState {
 
     [pscustomobject]@{
         Disabled = $disabled
+        DisabledServices = $disabledServices
         Unavailable = $unavailable
         PendingServices = $pendingServices
         TemplatePath = $templatePath
         TemplatePending = $templatePending
+        TemplateDisabled = $templateDisabled
         Instances = $instances
+    }
+}
+
+function Enable-NaturalizerOptionalGroup {
+    param([hashtable]$Group, $State)
+
+    $targets = @(foreach ($name in $State.DisabledServices) {
+        [pscustomobject]@{ Name = $name; TemplatePath = $null }
+    })
+    if ($State.TemplateDisabled) {
+        $targets += [pscustomobject]@{
+            Name = "$($Group['UserTemplatePrefix']) template"
+            TemplatePath = $State.TemplatePath
+        }
+    }
+    if ($targets.Count -eq 0) {
+        return
+    }
+
+    Write-NaturalizerRow '[>] Re-enable' ($targets.Name -join ', ') Cyan
+    Write-NaturalizerRow '[*] Startup type' 'Choose how each service starts. Templates take effect the next time you sign in.'
+    if ((Read-NaturalizerChoice 'Re-enable any of these targets? [Y/N]' @('Y', 'N')) -eq 'N') {
+        return
+    }
+
+    foreach ($target in $targets) {
+        $name = $target.Name
+        $choice = Read-NaturalizerChoice "Startup for $name ([M]anual, [A]utomatic, [S]kip)" @('M', 'A', 'S')
+        if ($choice -eq 'S') {
+            continue
+        }
+        $startup = if ($choice -eq 'A') { 'Automatic' } else { 'Manual' }
+        try {
+            if ($target.TemplatePath) {
+                $current = Get-ItemPropertyValue -LiteralPath $target.TemplatePath -Name 'Start' -ErrorAction Stop
+                if ($current -isnot [int]) {
+                    throw 'The service template startup type could not be read.'
+                }
+                if ($current -ne 4) {
+                    Write-NaturalizerRow '[-] Skipped' "$name is already enabled." DarkGray
+                    continue
+                }
+                $start = if ($choice -eq 'A') { 2 } else { 3 }
+                Set-VerifiedRegistryValue -Path $target.TemplatePath -Name 'Start' -Value $start
+                Write-Log "Re-enabled $name with $startup startup for future sign-ins." OK
+            }
+            else {
+                $service = Get-Service -Name $name -ErrorAction Stop
+                if ($null -eq $service.StartType) {
+                    throw 'The service startup type could not be read.'
+                }
+                if ($service.StartType -ne 'Disabled') {
+                    Write-NaturalizerRow '[-] Skipped' "$name is already enabled." DarkGray
+                    continue
+                }
+                Set-Service -Name $name -StartupType $startup -ErrorAction Stop
+                if ((Get-Service -Name $name -ErrorAction Stop).StartType -ne $startup) {
+                    throw 'The service manager did not report the requested startup type.'
+                }
+                Write-Log "Re-enabled $name with $startup startup." OK
+            }
+        }
+        catch {
+            Write-Log "Could not re-enable $name. $_" WARN
+        }
     }
 }
 
@@ -684,35 +813,49 @@ function Invoke-DualNatureGroup {
     }
 
     $label = $Group['Label']
-    Write-Host "`n$label"
-    Write-Host $Group['Description']
+    Write-NaturalizerSection $label
+    Write-NaturalizerRow '[*] Purpose' $Group['Purpose']
+    Write-NaturalizerRow '[!] If disabled' $Group['Impact'] Yellow
+    if ($Group['Privacy']) {
+        Write-NaturalizerRow '[*] Data and privacy' $Group['Privacy'] Cyan
+    }
+
     if ($Review) {
         if ($state.Disabled.Count -gt 0) {
-            Write-Host "Already disabled ($($state.Disabled -join ', '))."
+            Write-NaturalizerRow '[+] Disabled' ($state.Disabled -join ', ') Green
         }
         if ($state.Unavailable.Count -gt 0) {
-            Write-Host "Could not confirm the state of $($state.Unavailable -join ', ')."
+            Write-NaturalizerRow '[!] Unavailable' ($state.Unavailable -join ', ') Yellow
+        }
+    }
+    if ($changes.Count -gt 0) {
+        Write-NaturalizerRow '[>] Changes' ($changes -join ', ') Cyan
+    }
+
+    if ($Review) {
+        if ((Read-NaturalizerChoice 'Disable this group? [Y/N]' @('Y', 'N')) -eq 'N') {
+            Write-Log "Declined disabling $label." -SilentConsole
+            Enable-NaturalizerOptionalGroup -Group $Group -State $state
+            return
         }
         if ($changes.Count -eq 0) {
-            Write-Host 'This group has no changes to apply.'
+            Write-NaturalizerRow '[-] Changes' 'No pending actions for this group.' DarkGray
             return
         }
     }
-
-    Write-Host "This will $($changes -join ', ')."
-    if ((Read-Host 'Apply these changes? [y/N]') -notmatch '^\s*y\s*$') {
+    elseif ((Read-Host '     [?] Apply these changes? [y/N]') -notmatch '^\s*y\s*$') {
         Write-Log "Kept $label by user choice." -SilentConsole
         return
     }
 
     foreach ($name in $state.PendingServices) {
-        Disable-NaturalizerService -Name $name -Description $label
+        Disable-NaturalizerService -Name $name -Description $label -Report
     }
     if ($state.TemplatePending) {
         $prefix = $Group['UserTemplatePrefix']
         try {
             Set-VerifiedRegistryValue -Path $state.TemplatePath -Name 'Start' -Value 4
-            Write-Log "Disabled service template $prefix." -SilentConsole
+            Write-Log "Disabled service template $prefix." OK
         }
         catch {
             Write-Log "Could not disable service template $prefix. $_" WARN
@@ -728,68 +871,85 @@ if (-not $Watchdog) {
         @{
             Services = 'lfsvc'
             Label = 'Location'
-            Description = 'Windows uses location for maps, local weather, automatic time zones, and Find My Device. Disabling the service restricts apps that use Windows location and can stop those features from working. Apps may still estimate where you are from your IP address.'
+            Purpose = 'Windows uses location for maps, local weather, automatic time zones, and Find My Device.'
+            Impact = 'Apps that rely on Windows location can lose access, and those features can stop working.'
+            Privacy = 'Apps may still estimate your location from your IP address.'
         }
         @{
             Services = @('SensorDataService', 'SensrSvc', 'SensorMonitorSvc')
             Label = 'Device sensors'
-            Description = 'These services supply readings from sensors such as the accelerometer and ambient light sensor. Disabling them can stop automatic screen rotation and brightness and prevent apps from getting those readings through Windows.'
+            Purpose = 'Windows supplies apps and system features with readings from sensors such as the accelerometer and ambient light sensor.'
+            Impact = 'Automatic rotation, automatic brightness, and app access to sensor readings can stop.'
         }
         @{
             Services = @('WdiServiceHost', 'WdiSystemHost')
             Label = 'Windows diagnostic hosts'
-            Description = 'Windows uses these services to run troubleshooting routines that inspect system problems. Disabling them can stop automated diagnostics and repairs. Some troubleshooting routines use information about the device and the fault.'
+            Purpose = 'Windows uses these services to run troubleshooting routines.'
+            Impact = 'Automated diagnostics and repairs can stop.'
+            Privacy = 'Some troubleshooting routines use information about the device and the fault.'
         }
         @{
             Services = 'CDPSvc'
             UserTemplatePrefix = 'CDPUserSvc'
             Label = 'Connected devices'
-            Description = 'These services help Windows share activity and communicate with nearby or linked devices. Disabling them can interfere with Phone Link, nearby sharing, and casting.'
+            Purpose = 'Windows shares activity and communicates with nearby or linked devices.'
+            Impact = 'Phone Link, nearby sharing, and casting may stop working.'
         }
         @{
             UserTemplatePrefix = 'OneSyncSvc'
             Label = 'Mail, calendar, and contacts sync'
-            Description = 'Apps that use Windows account sync rely on this service to exchange mail, calendar, and contact data with your account provider. Disabling it can prevent those apps from receiving updates.'
+            Purpose = 'Apps that use Windows account sync exchange mail, calendar, and contact data with your account provider.'
+            Impact = 'Those apps can stop receiving updates.'
         }
         @{
             UserTemplatePrefix = 'cbdhsvc'
             Label = 'Clipboard history'
-            Description = 'This service supports clipboard history (Win+V) and optional sync across devices. Sync can send clipboard contents to your account. Disabling the service can stop history and sync.'
+            Purpose = 'Windows keeps clipboard history (Win+V) and can sync it across devices.'
+            Impact = 'Clipboard history and sync can stop.'
+            Privacy = 'Clipboard sync can send clipboard contents to your account.'
         }
         @{
             Services = 'WpnService'
             UserTemplatePrefix = 'WpnUserService'
             Label = 'Push notifications'
-            Description = 'Windows uses these services to deliver app notifications, including messages from the Windows Push Notification Service. Disabling them can stop notifications and badges from updating.'
+            Purpose = 'Windows uses these services to deliver notifications from apps and the Windows Push Notification Service.'
+            Impact = 'Notifications and badges can stop updating.'
         }
         @{
             Services = @('XblAuthManager', 'XblGameSave', 'XboxNetApiSvc')
             Label = 'Xbox services'
-            Description = 'Xbox services sign you in, sync game saves, and support multiplayer. Disabling them can break those features and interrupt sync with your Xbox account.'
+            Purpose = 'Xbox services handle sign-in, save sync, and multiplayer.'
+            Impact = 'Those features can stop working, including sync with your Xbox account.'
         }
         @{
             Services = 'MapsBroker'
             Label = 'Offline maps'
-            Description = 'Windows checks for and downloads updates for saved offline maps. Disabling this service stops those updates, so saved maps can become outdated.'
+            Purpose = 'Windows checks for and downloads updates for saved offline maps.'
+            Impact = 'Saved maps can become outdated.'
         }
         @{
             Services = 'DoSvc'
             Label = 'Delivery Optimization'
-            Description = 'Delivery Optimization manages Windows and Microsoft Store downloads. Depending on your settings, it can exchange update data with other PCs. Disabling the service can affect updates and downloads.'
+            Purpose = 'Delivery Optimization manages Windows and Microsoft Store downloads.'
+            Impact = 'Windows updates and Store downloads can be affected.'
+            Privacy = 'Depending on your settings, Windows can exchange update data with other PCs.'
         }
     )
 
     $eventLogGroup = @{
         Services = 'EventLog'
         Label = 'Windows Event Log (high impact)'
-        Description = 'Windows and apps use this service to record events for audits and troubleshooting. Disabling it can disrupt diagnostics, dependent services, and scheduled tasks, including the watchdog. Other components can read the local events it stores.'
+        Purpose = 'Windows and apps record events for auditing and troubleshooting.'
+        Impact = 'Diagnostics, dependent services, and scheduled tasks, including the watchdog, can fail.'
+        Privacy = 'Other components can read the local events this service stores.'
     }
 
     $reviewOptionalServices = $false
     foreach ($group in ($optionalServiceGroups + @($eventLogGroup))) {
         if ((Get-NaturalizerOptionalServiceState $group).Disabled.Count -gt 0) {
-            Write-Host 'Some optional services are already disabled.'
-            $reviewOptionalServices = (Read-Host 'Review all optional service groups again? [y/N]') -match '^\s*y\s*$'
+            Write-NaturalizerSection 'Optional services'
+            Write-NaturalizerRow '[+] Existing choices' 'Some optional services are already disabled.' Green
+            $reviewOptionalServices = (Read-Host '     [?] Review all optional service groups again? [y/N]') -match '^\s*y\s*$'
             break
         }
     }
@@ -842,9 +1002,11 @@ function Invoke-DefenderCloudPrompt {
         return
     }
 
-    Write-Host "`nMicrosoft Defender cloud protection"
-    Write-Host 'Defender can send security information and file samples to Microsoft for a cloud verdict. Turning off cloud reporting, automatic sample submission, and Block at First Sight reduces cloud-assisted detection of new threats. Local antivirus is a separate setting.'
-    if ((Read-Host 'Change these Defender preferences? [y/N]') -notmatch '^\s*y\s*$') {
+    Write-NaturalizerSection 'Microsoft Defender cloud protection'
+    Write-NaturalizerRow '[*] Purpose' 'Defender uses cloud verdicts to help detect new threats.'
+    Write-NaturalizerRow '[!] If disabled' 'Turning off cloud reporting, automatic sample submission, and Block at First Sight reduces cloud-assisted detection. Local antivirus is a separate setting.' Yellow
+    Write-NaturalizerRow '[*] Data and privacy' 'Defender can send security information and file samples to Microsoft.' Cyan
+    if ((Read-Host '     [?] Change these Defender preferences? [y/N]') -notmatch '^\s*y\s*$') {
         Write-Log 'Kept Defender cloud preferences by user choice.' -SilentConsole
         return
     }
@@ -855,7 +1017,7 @@ function Invoke-DefenderCloudPrompt {
         if (-not (Test-DefenderCloudPreferences $preference $desired)) {
             throw "Readback returned MAPSReporting=$($preference.MAPSReporting), SubmitSamplesConsent=$($preference.SubmitSamplesConsent), DisableBlockAtFirstSeen=$($preference.DisableBlockAtFirstSeen)."
         }
-        Write-Log 'Verified Defender cloud preferences for reporting, sample submission, and Block at First Sight.'
+        Write-Log 'Verified Defender cloud preferences for reporting, sample submission, and Block at First Sight.' OK
     }
     catch {
         Write-Log "Could not verify the requested Defender cloud preferences. $_" WARN
@@ -889,9 +1051,10 @@ function Invoke-SmartAppControlPrompt {
         return
     }
 
-    Write-Host "`nWindows Smart App Control"
-    Write-Host 'Smart App Control uses signatures and cloud reputation to decide which apps can run. Turning it off removes that protection and allows apps it would otherwise block.'
-    if ((Read-Host 'Turn off Smart App Control? [y/N]') -notmatch '^\s*y\s*$') {
+    Write-NaturalizerSection 'Windows Smart App Control'
+    Write-NaturalizerRow '[*] Purpose' 'Smart App Control uses signatures and cloud reputation to decide which apps can run.'
+    Write-NaturalizerRow '[!] If disabled' 'Apps that Smart App Control would block can run.' Yellow
+    if ((Read-Host '     [?] Turn off Smart App Control? [y/N]') -notmatch '^\s*y\s*$') {
         Write-Log 'Kept Smart App Control by user choice.' -SilentConsole
         return
     }
@@ -902,7 +1065,7 @@ function Invoke-SmartAppControlPrompt {
         if ((Get-ItemPropertyValue -LiteralPath $path -Name $name -ErrorAction Stop) -ne 0) {
             throw 'The Smart App Control policy value changed after refresh.'
         }
-        Write-Log 'Verified the Smart App Control policy value is Off after refresh.'
+        Write-Log 'Verified the Smart App Control policy value is Off after refresh.' OK
     }
     catch {
         Write-Log "Could not verify the Smart App Control change. $_" WARN
@@ -1196,9 +1359,9 @@ function Remove-NaturalizerDiagnosticEntry {
 }
 
 if (-not $Watchdog) {
-    Write-Host "`nClear existing Windows Event Logs"
-    Write-Host 'This permanently erases existing events, including records used for audits and troubleshooting.'
-    if ((Read-Host 'Permanently clear the Event Logs? [y/N]') -match '^\s*y\s*$') {
+    Write-NaturalizerSection 'Clear existing Windows Event Logs'
+    Write-NaturalizerRow '[!] Permanent' 'Clears existing events, including records used for audits and troubleshooting.' Red
+    if ((Read-Host '     [?] Permanently clear the Event Logs? [y/N]') -match '^\s*y\s*$') {
         try {
             $logs = @(Invoke-NaturalizerNative -Executable 'wevtutil.exe' -Arguments 'el')
             foreach ($log in $logs) {
@@ -1219,9 +1382,10 @@ if (-not $Watchdog) {
         }
     }
 
-    Write-Host "`nDelete existing diagnostic files"
-    Write-Host 'This permanently deletes files under C:\ProgramData\Microsoft\Diagnosis and C:\Windows\System32\wsqm, including records that may help diagnose Windows problems.'
-    if ((Read-Host 'Permanently delete these diagnostic files? [y/N]') -match '^\s*y\s*$') {
+    Write-NaturalizerSection 'Delete existing diagnostic files'
+    Write-NaturalizerRow '[*] Paths' 'C:\ProgramData\Microsoft\Diagnosis and C:\Windows\System32\wsqm'
+    Write-NaturalizerRow '[!] Permanent' 'Deletes existing files under these paths, including records that may help diagnose Windows problems.' Red
+    if ((Read-Host '     [?] Permanently delete these diagnostic files? [y/N]') -match '^\s*y\s*$') {
         foreach ($path in @('C:\ProgramData\Microsoft\Diagnosis', 'C:\Windows\System32\wsqm')) {
             try {
                 if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {

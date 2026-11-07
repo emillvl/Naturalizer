@@ -83,9 +83,11 @@ If you edit the file, save it as UTF-8 with a BOM so Windows PowerShell 5.1 read
 
 **Dual-purpose services** are handled interactively. Naturalizer explains what they do and what may stop working if you disable them. The optional groups cover Geolocation (`lfsvc`), Sensors, WDI diagnostic hosts, Phone Link (`CDPSvc`/`CDPUserSvc`), Mail/Calendar sync (`OneSyncSvc`), Clipboard History (`cbdhsvc`), Push Notifications (`WpnService`/`WpnUserService`), Xbox services, Offline Maps (`MapsBroker`), Delivery Optimization (`DoSvc`), and **Windows Event Log (`EventLog`, high impact)**.
 
-When Naturalizer finds an optional service, per-user instance, or template already disabled, it asks **Review all optional service groups again? [y/N]** once. Answer `y` to see all groups in their usual order, including their descriptions and which targets are already disabled. Groups with pending changes still ask for confirmation.
+When Naturalizer finds an optional service, per-user instance, or template already disabled, it asks **Review all optional service groups again? [y/N]** once. Answer `y` to go through all 11 groups in order. Every group waits for `y` or `n` at **Disable this group? [Y/N]**, even if the group is already disabled. Blank or invalid input repeats the question.
 
-Press Enter or answer `n` to see only groups that need action. On a run where none of the optional services are disabled, Naturalizer goes straight to the pending groups. Disabled per-user templates apply at future logons. The script stops the running instances listed in the prompt and logs unavailable or unreadable checks separately. [Microsoft documentation for per-user services](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows)
+If you answer `n` to disabling a group, Naturalizer offers to re-enable any disabled regular services or per-user templates in that group. Choose **Manual**, **Automatic**, or **Skip** for each target. Re-enabling sets the startup type. Windows uses updated per-user templates at the next sign-in.
+
+At the initial review prompt, press Enter or answer `n` to see only groups that need action. On a run where none of the optional services are disabled, Naturalizer goes straight to the pending groups. Disabled per-user templates apply at future logons. The script stops the running instances listed in the prompt and logs unavailable or unreadable checks separately. [Microsoft documentation for per-user services](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows)
 
 **Microsoft Defender cloud protection** has an optional prompt for cloud reporting, automatic sample submission, and Block at First Sight. Naturalizer skips the prompt when all three preferences already match and verifies the preferences after a change. Operational protection depends on Defender and policy. **Smart App Control** has a separate optional prompt when its policy is On or in Evaluation. An Off policy skips the prompt. If the policy state is unknown, Naturalizer records it and skips the change. Both options can reduce protection. [Defender cloud settings](https://learn.microsoft.com/en-us/defender-endpoint/configure-block-at-first-sight-microsoft-defender-antivirus) · [Smart App Control](https://support.microsoft.com/en-us/windows/security/windows-security/app-browser-control-in-the-windows-security-app)
 
@@ -178,15 +180,16 @@ Windows 10 and supported Windows 11 releases, including Windows 11 26H2, are the
 
 On **Windows 11 26H2 with the October 13, 2026 update (build 26300.9711)**, both v1.5.0 entry points passed PowerShell 5.1 tests. The tests covered exact source persistence, prompt suppression, and stopping before settings changes when setup fails. An isolated watchdog passed startup and logon trigger readback and ran on demand as SYSTEM. The host's Event Log service was already disabled, so channel enumeration failed. Full application of Windows settings, automatic startup and sign-in runs, and tests on other builds remain open. [Microsoft's October update](https://support.microsoft.com/en-us/servicing/os/windows-11/2026/10/kb5127648-windows-11-24h2-25h2-26h2-security-update)
 
-On the same build, v1.5.1 tests in PowerShell 5.1 used simulated service states to check the review choices, first-run behavior, per-user services, and noninteractive watchdog execution.
+On the same build, v1.5.1 tests in PowerShell 5.1 verified that all 11 review prompts wait for an explicit answer. Tests with simulated services covered the pending-only walkthrough, re-enabling regular services and per-user templates, first-run behavior, and noninteractive watchdog execution.
 
 The install-folder repair was tested on the same build against real folders with the inherited grant and the copied rule left by a failed upgrade.
 
 ## Changes in 1.5.1
 
 - Added a one-time prompt to review all optional service groups when an optional service, per-user instance, or template is already disabled.
-- Full review shows completed groups in the usual order. Pending changes still require confirmation, and declining the review keeps the pending-only flow.
-
+- Full review waits for a disable decision at all 11 groups. Declining full review keeps the pending-only walkthrough.
+- Declining a disable during full review offers to re-enable disabled services and templates with the startup type you choose.
+- Restored the colored banner, group headings, and status markers.
 - Fixed the install-folder upgrade for folders with the inherited ProgramData Users write grant or the explicit copy left by an earlier failed run. Setup verifies the restricted permissions before continuing.
 
 ## Changes in 1.5.0
