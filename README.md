@@ -2,146 +2,201 @@
 
 # Naturalizer
 
-### Reduce targeted Windows telemetry, behavioral profiling, and data collection.
+**Take control of Windows diagnostics and telemetry.**
 
-Run it once. The watchdog reapplies the default changes at startup and sign-in.
+A PowerShell utility for targeted privacy settings, transparent system-level choices, and persistence across restarts.
 
-[![version](https://img.shields.io/badge/version-1.5.1-blue)](https://github.com/emillvl/Naturalizer/releases/tag/v1.5.1)
-![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20Server-0078D6)
-![powershell](https://img.shields.io/badge/PowerShell-5.1-5391FE)
-![license](https://img.shields.io/badge/license-MIT-green)
+[![Version](https://img.shields.io/badge/version-1.5.1-2563eb?style=flat-square)](https://github.com/emillvl/Naturalizer/releases/tag/v1.5.1)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE?style=flat-square)
+[![License](https://img.shields.io/badge/license-MIT-334155?style=flat-square)](LICENSE)
+
+**[Quick start](#quick-start)** · **[Coverage](#coverage)** · **[Choices & trade-offs](#choices--trade-offs)** · **[Watchdog](#watchdog--integrity)** · **[Recovery](#recovery)**
 
 </div>
 
 ---
 
-## The book this project became
+Naturalizer targets selected Windows services, scheduled tasks, registry policies, WMI subscriptions, and ETW AutoLoggers. Network blocking is optional. The script can be rerun after Windows updates, and its watchdog reapplies the default settings at startup and sign-in.
 
-**Naturalizer is the origin of [Windows Never Forgets](https://github.com/emillvl/windows-never-forgets).**
+**It does not guarantee that Windows stops all telemetry.** Available controls and their effects depend on the Windows edition, build, and applicable policies.
 
-That repository — the 163-page field guide to what Windows remembers, and how forensic investigators read it back — is **based directly on this project**. Naturalizer was built first. The hunt for every service, scheduled task, registry policy, ETW session, and network endpoint that quietly reports on a Windows machine is what produced the research behind the book. *Windows Never Forgets* is the full technical companion to this script — it documents, in plain language, exactly the machinery Naturalizer switches off, and much more.
+> [!WARNING]
+> Naturalizer changes system-wide settings. Some choices can disrupt diagnostics, Windows features, application compatibility, and security protection. **Read the prompts and save your existing configuration before running it.** There is no one-click rollback.
 
-- **This repo (`Naturalizer`)** — the tool. It acts on the system.
-- **[`windows-never-forgets`](https://github.com/emillvl/windows-never-forgets)** — the book built on it. It explains the system.
+## At a glance
 
-If you want to understand *why* each change here exists, read the book. If you want the change applied for you, run this script.
+| Mode | What happens |
+| :--- | :--- |
+| **Default** | Applies the targeted service, scheduled-task, registry, WMI, and ETW changes. |
+| **Ask first** | Explains and requests permission for dual-purpose services, location, SmartScreen, Defender cloud settings, Smart App Control, and destructive cleanup. |
+| **Opt-in** | Adds firewall and/or hosts-file blocking only when requested with command switches. |
+| **Watchdog** | Runs silently as SYSTEM at startup and sign-in, reapplying default settings without interactive prompts. |
 
----
+**No run log files.** Interactive results appear in the PowerShell console; the watchdog is silent and reports failure through its process exit status.
 
-## What it does
+## Quick start
 
-Windows uses services, scheduled tasks, policies, and tracing sessions to collect diagnostics and usage data. Naturalizer targets specific parts of that pipeline across eight phases, including WMI subscriptions and optional network-level blocking. The watchdog reapplies the default changes after startup and logon. Coverage varies by Windows edition, build, and policy.
+**Requirements:** Windows PowerShell **5.1**, an **elevated (Administrator)** session, and Windows 10 or 11. Windows Server 2016–2022 is a compatibility target, but testing for this release is incomplete.
 
-Naturalizer is designed to be **idempotent**. You can rerun it to check the same targets after a major Windows feature update.
+### Option A — paste the script
 
-## Requirements
+1. Open [`naturalizer.ps1`](naturalizer.ps1) and select **Raw**.
+2. Copy the **entire** file.
+3. Paste it into an elevated **Windows PowerShell 5.1** console as a single block. Press Enter if PowerShell is still waiting for the command to finish.
 
-- Windows 10 or Windows 11. Windows Server 2016–2022 is also a compatibility target with testing still pending for this release.
-- Windows PowerShell 5.1. Naturalizer uses `Get-WmiObject` and `Remove-WmiObject`.
-- **Administrator rights**. Both the saved script and the pasted command check for elevation.
+The pasted command runs directly and prepares its verified local watchdog copy; it is **not** executed a second time as a saved file.
 
-## Usage
+To supply switches when pasting, append them to the final `} @args` line, for example `} @args -BlockHosts -SkipRestorePoint`.
 
-### Paste from GitHub
+### Option B — run the downloaded script
 
-Open the raw view of `naturalizer.ps1`. Copy the entire file and paste it into an elevated Windows PowerShell 5.1 prompt in one go. Press Enter if PowerShell is waiting for you to submit it. Naturalizer verifies its local copy and watchdog before applying settings in the same session. [Open naturalizer.ps1](naturalizer.ps1)
-
-To pass switches, append them to the final `} @args` line before running. For example, end the block with `} @args -BlockHosts -SkipRestorePoint`.
-
-### Run the saved script
-
-Open an elevated Windows PowerShell 5.1 prompt in the folder containing `naturalizer.ps1`. Use a session whose execution policy permits local scripts. The first line below applies the policy to the current process.
+Save [`naturalizer.ps1`](naturalizer.ps1), open an elevated Windows PowerShell 5.1 prompt in its directory, and run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 .\naturalizer.ps1
 ```
 
-To also block telemetry at the network layer, run the saved script with both network switches.
+To request both optional network-blocking methods:
 
 ```powershell
 .\naturalizer.ps1 -BlockFirewall -BlockHosts
 ```
 
-If you edit the file, save it as UTF-8 with a BOM so Windows PowerShell 5.1 reads it consistently. After the local script and watchdog checks pass, Naturalizer attempts to create a restore point before applying Windows settings. The console reports whether Windows created it.
+To check the command without installing or applying settings:
 
-## Parameters
+```powershell
+.\naturalizer.ps1 -WhatIf
+```
 
-| Parameter | Description |
-|---|---|
-| `-BlockFirewall` | Adds outbound TCP block rules for addresses resolved from the listed telemetry domains. Rules are named `Naturalizer-Block-<host>`. |
-| `-BlockHosts` | Adds `0.0.0.0` entries for the listed telemetry domains to the system `hosts` file and flushes DNS. |
+If you edit the script, save it as **UTF-8 with a BOM** for Windows PowerShell 5.1. Unless `-SkipRestorePoint` is specified, Naturalizer attempts a restore point after local script and watchdog setup; the console reports whether Windows created it.
+
+### Command reference
+
+| Switch | Behavior |
+| :--- | :--- |
+| `-BlockFirewall` | Blocks outbound TCP connections to IP addresses resolved from listed telemetry domains. |
+| `-BlockHosts` | Adds the listed domains to the system `hosts` file as `0.0.0.0` entries and flushes DNS. |
 | `-SkipRestorePoint` | Skips the restore-point attempt. |
-| `-WhatIf` | Checks the command and exits before installation or settings changes. |
-| `-Watchdog` | Internal switch used by the scheduled task for noninteractive runs at startup and logon. |
+| `-WhatIf` | Exits before installation and settings changes. |
+| `-Watchdog` | Internal, noninteractive mode for the scheduled task; not intended for normal use. |
 
-## What it changes
+## Coverage
 
-### Phase 1 & 2 — Services
+| Phase | Target | Behavior |
+| :--- | :--- | :--- |
+| **1–2** | Services | Disables selected diagnostic/telemetry services; asks separately about dual-purpose services. |
+| **3** | Scheduled tasks | Disables specified diagnostic, feedback, and telemetry-related tasks. |
+| **3B** | WMI subscriptions | Checks narrowly identified legacy build-verification objects against an explicit allowlist. |
+| **4** | Registry | Applies selected data-collection, search, activity, personalization, and other policies. |
+| **5** | ETW AutoLoggers | Disables boot start for four targeted sessions and checks provider settings. |
+| **6** | Firewall | *Optional.* Adds outbound rules for resolved telemetry endpoint addresses. |
+| **7** | Hosts | *Optional.* Adds a delimited block of telemetry domains. |
+| **8** | Watchdog | Installs and verifies the protected local copy and startup/logon scheduled task **before** the settings phases run. |
 
-**Services targeted by default** include `DiagTrack`, `dmwappushsvc`, `diagsvc`, `DPS`, `wisvc`, `RetailDemoSvc`, `WerSvc`, `AisSvc`, `PcaSvc`, and `SSDPSRV`.
+<details>
+<summary><strong>See the technical targets and limitations</strong></summary>
 
-**Dual-purpose services** are handled interactively. Naturalizer explains what each group does, what may stop working, and how the services handle data. The optional groups cover Geolocation (`lfsvc`), Sensors, WDI diagnostic hosts, Phone Link (`CDPSvc`/`CDPUserSvc`), Mail/Calendar sync (`OneSyncSvc`), Clipboard History (`cbdhsvc`), Push Notifications (`WpnService`/`WpnUserService`), Xbox services, Offline Maps (`MapsBroker`), Delivery Optimization (`DoSvc`), and **Windows Event Log (`EventLog`, high impact)**.
+### Services and scheduled tasks
 
-When Naturalizer finds an optional service, per-user instance, or template already disabled, it asks **Review all optional service groups again? [y/N]** once. Answer `y` to go through all 11 groups in order. Every group waits for `y` or `n` at **Disable this group? [Y/N]**, even if the group is already disabled. Blank or invalid input repeats the question.
+Default service targets include `DiagTrack`, `dmwappushsvc`, `diagsvc`, `DPS`, `wisvc`, `RetailDemoSvc`, `WerSvc`, `AisSvc`, `PcaSvc`, and `SSDPSRV`.
 
-At each group in full review, `y` disables the group and `n` re-enables its disabled services and templates. Naturalizer uses built-in startup types based on Microsoft's service guidance. Windows uses updated per-user templates at the next sign-in. [Windows service startup types](https://learn.microsoft.com/en-us/windows/iot/iot-enterprise/optimize/services) · [Per-user service templates](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows)
+Scheduled tasks include the Compatibility Appraiser, Customer Experience Improvement Program, Windows Error Reporting queue, Disk Diagnostic collectors, Feedback/Siuf, Device Information, Maps, Shell Family Safety, and Windows AI analysis targets listed in the script.
 
-At the initial review prompt, press Enter or answer `n` to see only groups that need action. On a run where none of the optional services are disabled, Naturalizer goes straight to the pending groups. Disabled per-user templates apply at future logons. The script stops the running instances listed in the prompt. Full review also shows unavailable or unreadable targets. [Microsoft documentation for per-user services](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows)
+### WMI subscriptions
 
-**Mail, calendar, and contacts sync.** Disabling Sync Host can interrupt built-in Mail and Calendar apps that use Windows account sync. Classic Outlook desktop keeps syncing mail through its own account connection. [Outlook account sync](https://support.microsoft.com/en-us/outlook/sync-basics-what-you-can-and-cannot-sync)
+Naturalizer inventories filters, consumers, and bindings under `root\subscription`. Its allowlist checks the exact identity and configuration of the legacy `BVTFilter` and `BVTConsumer` build-verification registration. It removes matching bindings first and retains objects still referenced by other bindings. See [Microsoft KB 2545227](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/event-10-is-logged-in-application-log).
 
-**Microsoft Defender cloud protection** has an optional prompt for cloud reporting, automatic sample submission, and Block at First Sight. Naturalizer skips the prompt when all three preferences already match and verifies the preferences after a change. Operational protection depends on Defender and policy. **Smart App Control** has a separate optional prompt when its policy is On or in Evaluation. An Off policy skips the prompt. If the policy state is unknown, Naturalizer skips the change. Both options can reduce protection. [Defender cloud settings](https://learn.microsoft.com/en-us/defender-endpoint/configure-block-at-first-sight-microsoft-defender-antivirus) · [Smart App Control](https://support.microsoft.com/en-us/windows/security/windows-security/app-browser-control-in-the-windows-security-app)
+### Registry policies
 
-The prompt to disable the Windows Event Log service comes after watchdog setup and cleanup. Disabling the service can disrupt diagnostics, auditing, and scheduled tasks.
+Targets include diagnostic data collection, Cortana and web search, activity feed and timeline, advertising ID, input personalization and speech, error reporting, preview builds, content delivery, Delivery Optimization, and Windows AI data analysis. Values are checked after writing, and errors are reported to the interactive console.
 
-### Phase 3 — Scheduled tasks
+The Windows Error Reporting crash-dump folder uses the expandable `%LOCALAPPDATA%\CrashDumps` value rather than resolving it to the administrator's or SYSTEM's profile at configuration time. See [Microsoft's dump settings documentation](https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps).
 
-Disables the telemetry and diagnostic tasks targeted by the script, including Compatibility Appraiser, Customer Experience Improvement Program tasks, the Windows Error Reporting queue, Disk Diagnostic collectors, Feedback/Siuf, Device Information, Maps, Shell Family Safety, and Windows AI analysis.
+SmartScreen and Windows location access are **not** unconditionally disabled by the registry phase; see [Choices & trade-offs](#choices--trade-offs).
 
-### Phase 3B — WMI diagnostic subscriptions
+### ETW AutoLoggers
 
-Inventories filters, consumers, and bindings in `root\subscription`. The allowlist identifies the legacy Windows build-verification filter `BVTFilter` and consumer `BVTConsumer` by their exact identities and configuration. Naturalizer removes matching bindings first and keeps any filter or consumer still referenced by a binding. [Microsoft KB 2545227](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/event-10-is-logged-in-application-log)
+The targeted sessions are `AutoLogger-Diagtrack-Listener`, `SQMLogger`, `DiagLog`, and `NOISY`. Naturalizer changes their **next-boot** settings; a registry change does not itself stop a live session. Use `logman query -ets` in an elevated console to inspect active sessions. [Microsoft AutoLogger documentation](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-an-autologger-session).
 
-### Phase 4 — Registry policies
+### Optional network blocking
 
-Writes policy values for data collection, Cortana and web search, activity feed and timeline, advertising ID, input personalization and speech, error reporting, preview builds, content delivery and consumer features, Delivery Optimization, and Windows AI data analysis. Naturalizer reads the values back and reports errors in the interactive console. The crash-dump folder uses the expandable path `%LOCALAPPDATA%\CrashDumps`. [Windows Error Reporting dump settings](https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps)
+`-BlockFirewall` resolves the script's listed Microsoft telemetry hosts to IP addresses and adds outbound **TCP** block rules named `Naturalizer-Block-<host>`. Resolved addresses can change or be shared with other services, so these rules can affect unrelated traffic. Rerun the option to refresh addresses.
 
-Naturalizer turns off **SmartScreen for apps and files** only after an explicit `y`. The prompt explains the warnings you lose and the file reputation data SmartScreen can send to Microsoft. [Microsoft Defender SmartScreen](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)
+`-BlockHosts` appends a clearly marked Naturalizer section to `C:\Windows\System32\drivers\etc\hosts` and flushes DNS. The two options can be used together.
 
-The **Location** prompt also controls the registry settings for Windows location access, location scripting, and location-aware search. Answering `n` during full review re-enables the service if needed, clears matching local policy blocks, and switches the machine-wide location setting from Deny to Allow if it is off. Declining in the pending-only walkthrough preserves the current registry settings.
+</details>
 
-### Phase 5 — ETW AutoLogger sessions
+## Choices & trade-offs
 
-Checks boot start for `AutoLogger-Diagtrack-Listener`, `SQMLogger`, `DiagLog`, and `NOISY`. The parent `Start` value controls whether the session starts at the next boot. Naturalizer verifies this value and reports errors updating provider `Enabled` values separately. It skips provider writes on later runs when boot start is already off.
+Naturalizer distinguishes targeted default changes from functions that may also serve legitimate purposes. Its optional prompts explain the feature, what disabling it may break, and the privacy implications.
 
-Use `logman query -ets` from an elevated prompt to check which sessions are running now. [Microsoft AutoLogger documentation](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-an-autologger-session)
+<details>
+<summary><strong>Dual-purpose services — all 11 groups</strong></summary>
 
-### Optional destructive cleanup
+| Group | Possible impact if disabled |
+| :--- | :--- |
+| Location (`lfsvc`) | Maps, Find My Device, and automatic time zone behavior. |
+| Device sensors | Auto-rotation, adaptive brightness, and sensor-dependent apps. |
+| Windows diagnostic hosts | Troubleshooting and automatic repair routines. |
+| Connected devices | Phone Link, Nearby Sharing, and casting. |
+| Mail, calendar, and contacts sync | Apps using Windows account sync; classic Outlook desktop uses its own connection. |
+| Clipboard history | Win+V history and optional cross-device sync. |
+| Push notifications | App alerts, badges, and notifications. |
+| Xbox services | Xbox sign-in, cloud saves, and multiplayer. |
+| Offline maps | Downloaded map access and updates. |
+| Delivery Optimization | Windows Update and Microsoft Store downloads. |
+| **Windows Event Log — high impact** | Auditing, troubleshooting, dependent services, and potentially scheduled tasks. |
 
-With an explicit `y` at the relevant prompt, Naturalizer can clear **existing Windows Event Logs** or delete existing diagnostic files under `C:\ProgramData\Microsoft\Diagnosis` and `C:\Windows\System32\wsqm`. Both options are off by default. Each permanently removes the selected records.
+On a later run, if an optional service or template is already disabled, Naturalizer offers a **full review** of all 11 groups. In full review, `Y` disables the group; `N` re-enables its disabled services and templates using the configured startup types. Otherwise, it shows groups with pending actions. Per-user templates take effect on later sign-ins. [Microsoft service startup guidance](https://learn.microsoft.com/en-us/windows/iot/iot-enterprise/optimize/services) · [Per-user services](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows).
 
-### Phase 6 — Firewall (opt-in)
+**Location consistency:** The Location decision also governs the matching registry settings for location access, scripting, and location-aware search. Full-review re-enabling clears matching local policy blocks and restores the machine-wide location setting from Deny to Allow when applicable; declining in pending-only mode leaves existing registry settings unchanged.
 
-Adds outbound TCP block rules for addresses resolved from the listed `events.data.microsoft.com` subdomains, `vortex.data.microsoft.com`, `settings-win.data.microsoft.com`, the Watson/OCA telemetry hosts, `data.microsoft.com`, and related endpoints. These addresses can change or be shared with other services. Rerun `-BlockFirewall` to refresh them.
+The **Event Log** prompt is deliberately presented after watchdog setup and optional cleanup.
 
-### Phase 7 — Hosts file (opt-in)
+</details>
 
-Appends a clearly delimited `Naturalizer` block with `0.0.0.0` entries to the system hosts file and flushes the DNS cache.
+<details>
+<summary><strong>Security and privacy prompts</strong></summary>
 
-### Phase 8 — Boot-start watchdog
+- **Defender cloud protection:** Optionally changes cloud reporting, automatic sample submission, and Block at First Sight. Disabling them can weaken detection of unknown threats. The script checks current preferences and verifies requested changes. [Microsoft documentation](https://learn.microsoft.com/en-us/defender-endpoint/configure-block-at-first-sight-microsoft-defender-antivirus).
+- **Smart App Control:** Separately prompts when its policy is On or in Evaluation. Unknown or already Off states are skipped. Turning it off can let applications run that it would otherwise block. [Microsoft documentation](https://support.microsoft.com/en-us/windows/security/windows-security-app-browser-control-in-the-windows-security-app).
+- **Microsoft Defender SmartScreen:** Explicitly asks before disabling reputation warnings for downloaded apps and files. Declining leaves those settings alone; the watchdog does not make this optional change. [Microsoft documentation](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
 
-Naturalizer prepares the watchdog before the settings phases. It saves its running source at `C:\ProgramData\Naturalizer\naturalizer.ps1`. Saved-file runs use the original bytes. Pasted runs save the complete command as UTF-8 with a BOM and Windows line endings, without any switches passed for that run.
+</details>
 
-Naturalizer compares the source and installed file by SHA-256 and leaves a matching file untouched. For a missing or different file, it validates a temporary copy, moves or atomically replaces the installed file, and verifies the installed hash. The install directory must restrict writes to trusted administrators and SYSTEM. Naturalizer rejects redirected paths and unsafe file permissions. On older installations, Naturalizer removes the matching ProgramData Users write grant. This also covers the explicit copy of that rule left by a failed v1.5.0 or v1.5.1 upgrade.
+<details>
+<summary><strong>Destructive cleanup — optional and off by default</strong></summary>
 
-The `Naturalizer_Watchdog` task launches Windows PowerShell with a hidden window and `-NonInteractive`, using the verified absolute path and the internal `-Watchdog` switch. It runs as **SYSTEM at highest privileges**, at **startup and logon**. Naturalizer reads back the saved definition before continuing. If setup fails, it stops before changing Windows settings and attempts to restore the previous file and task when needed.
+Separate `y/N` prompts can:
 
-The watchdog reapplies the default changes and skips restore points, optional prompts, SmartScreen and Location changes, and the optional cleanup of existing logs and diagnostic files. Firewall and hosts-file switches apply to the normal run that requests them. In watchdog mode, `HKCU` refers to SYSTEM's registry hive.
+- Clear **existing Windows Event Logs**, including records used for audits and troubleshooting.
+- Delete existing diagnostic files beneath `C:\ProgramData\Microsoft\Diagnosis` and `C:\Windows\System32\wsqm`.
 
-#### Check registration and execution
+These actions permanently remove the selected records. A backup is required to recover deleted data. The watchdog does **not** perform this cleanup.
 
-Check the saved task and file from an elevated prompt.
+</details>
+
+## Watchdog & integrity
+
+Naturalizer prepares its scheduled task **before** applying Windows settings. The saved script lives at:
+
+```text
+C:\ProgramData\Naturalizer\naturalizer.ps1
+```
+
+- **Same source, no rewrite:** It compares the running source and installed file using SHA-256. Matching copies are left untouched.
+- **Missing or different file:** It stages and syntax-checks the source, moves or atomically replaces the installed file, and verifies the resulting hash.
+- **Protected installation:** The directory and script must have trusted ownership and restricted write permissions. Unsafe or redirected paths are rejected; known legacy permission issues are repaired when possible.
+- **Verified task:** `Naturalizer_Watchdog` runs as **SYSTEM**, with highest privileges, at **startup and all-user logon**. The saved action and triggers are read back.
+- **Failure recovery:** Installation failures stop the run before settings changes and attempt to restore the previous script and task.
+
+The watchdog runs hidden and noninteractively. It reapplies default settings, but skips restore points, optional prompts, SmartScreen and Location choices, destructive cleanup, and network options not supplied to a normal run. In watchdog mode, `HKCU` refers to SYSTEM's registry hive.
+
+### Verify the installation
+
+From an elevated PowerShell prompt:
 
 ```powershell
 $task = Get-ScheduledTask -TaskPath '\' -TaskName Naturalizer_Watchdog
@@ -151,72 +206,83 @@ $task.Principal | Format-List UserId, LogonType, RunLevel
 Get-FileHash -LiteralPath C:\ProgramData\Naturalizer\naturalizer.ps1 -Algorithm SHA256
 ```
 
-Expect startup and logon triggers, SYSTEM at highest privileges, and an action containing `-File "C:\ProgramData\Naturalizer\naturalizer.ps1" -Watchdog`.
+Expect both triggers, a SYSTEM principal at highest privileges, and an action containing `-File "C:\ProgramData\Naturalizer\naturalizer.ps1" -Watchdog`.
 
-On a test machine where you intend to apply the default changes, start the task and wait for it to finish.
+On a test machine **where you intend to apply the default changes**, you can check task execution:
 
 ```powershell
 Start-ScheduledTask -TaskPath '\' -TaskName Naturalizer_Watchdog
 Get-ScheduledTaskInfo -TaskPath '\' -TaskName Naturalizer_Watchdog
 ```
 
-Check `LastRunTime` and `LastTaskResult` after the task finishes. The watchdog exits with code `1` if a settings phase fails and `0` if the run succeeds. Restart and sign in separately to exercise the automatic triggers.
+Inspect `LastRunTime` and `LastTaskResult` after the task finishes. The watchdog exits with code `1` if a settings phase fails and `0` on success. Restart and sign in separately to exercise the automatic triggers.
 
-## Console output
+Interactive runs use colored console markers: `[+] Done.` for a completed phase and `[x] Could not complete.` after a reported phase failure. **Naturalizer creates no run log files.**
 
-Interactive runs report each phase in the console. A green `[+] Done.` means the checks and applicable changes completed. Errors appear in red with `[x] Could not complete.` at the end of the phase. Naturalizer writes no run log files. The watchdog runs silently.
+## Recovery
 
-## Reverting
+Naturalizer does not automatically restore your prior Windows configuration. Record the initial settings or keep a verified restore point/system backup.
 
-Save your original configuration before running Naturalizer. A verified restore point or system backup can help with recovery. Restore individual settings to their previous values.
+1. **Remove the watchdog first:** `Unregister-ScheduledTask -TaskPath '\' -TaskName Naturalizer_Watchdog -Confirm:$false`.
+2. **Services:** Restore each original startup type with `Set-Service -Name <svc> -StartupType Manual` or `Automatic` as appropriate. For per-user templates, restore the original `Start` registry values (typically `3` for Manual or `2` for Automatic).
+3. **Firewall:** Remove optional Naturalizer rules with `Get-NetFirewallRule -DisplayName "Naturalizer-Block-*" | Remove-NetFirewallRule`.
+4. **Hosts file:** Remove only the entries between `# === Naturalizer` and `# === End Naturalizer`.
+5. **Registry:** Restore values from your saved configuration under the affected `HKLM` and `HKCU` paths. Remove an added policy value only if it was absent previously.
 
-- Remove the watchdog before restoring settings with `Unregister-ScheduledTask -TaskPath '\' -TaskName Naturalizer_Watchdog -Confirm:$false`.
-- Restore each service's original startup type with `Set-Service -Name <svc> -StartupType Manual` or `Automatic`, as appropriate. For a service template, restore the original `Start` value under `HKLM:\SYSTEM\CurrentControlSet\Services\<svc>`. Values `3` and `2` correspond to Manual and Automatic.
-- Remove the optional firewall rules with `Get-NetFirewallRule -DisplayName "Naturalizer-Block-*" | Remove-NetFirewallRule`.
-- Remove the hosts block between `# === Naturalizer` and `# === End Naturalizer` in `C:\Windows\System32\drivers\etc\hosts`.
-- Restore the specific policy values changed under `HKLM:\SOFTWARE\Policies\Microsoft\Windows\...` and `HKCU:\SOFTWARE\Policies\Microsoft\Windows\...` from your saved configuration. Delete a value only if it was absent before the run.
+Deleted Event Logs and diagnostic files cannot be recovered without a backup.
 
-Deleted Event Logs and diagnostic files require a backup for recovery.
+## Compatibility & validation
 
-## Compatibility and validation
+**Supported targets:** Windows 10 and Windows 11 with Windows PowerShell 5.1. Windows Server 2016–2022 is an intended compatibility target; testing is incomplete.
 
-Windows 10 and supported Windows 11 releases, including Windows 11 26H2, are the compatibility targets. Use Windows PowerShell 5.1.
+<details>
+<summary><strong>Read the documented test coverage and remaining gaps</strong></summary>
 
-On **Windows 11 26H2 with the October 13, 2026 update (build 26300.9711)**, both v1.5.0 entry points passed PowerShell 5.1 tests. The tests covered exact source persistence, prompt suppression, and stopping before settings changes when setup fails. An isolated watchdog passed startup and logon trigger readback and ran on demand as SYSTEM. The host's Event Log service was already disabled, so channel enumeration failed. Full application of Windows settings, automatic startup and sign-in runs, and tests on other builds remain open. [Microsoft's October update](https://support.microsoft.com/en-us/servicing/os/windows-11/2026/10/kb5127648-windows-11-24h2-25h2-26h2-security-update)
+On **Windows 11 26H2 with the October 13, 2026 update (build 26300.9711)**, the v1.5.0 saved-file and direct-paste entry points passed PowerShell 5.1 tests for source persistence, prompt suppression, and stopping before settings changes when setup failed. An isolated watchdog passed startup/logon trigger readback and an on-demand run as SYSTEM.
 
-On the same build, v1.5.1 tests in PowerShell 5.1 verified that all 11 review prompts wait for an explicit answer. Tests with simulated Windows settings covered direct re-enabling, the pending-only walkthrough, first-run behavior, phase results on success and failure, and silent watchdog execution. The saved-file and direct-paste runs created no log files.
+On the same build, v1.5.1 tests verified all 11 explicit review prompts. Simulated Windows settings covered direct re-enabling, pending-only review, first-run behavior, phase success/failure results, and silent watchdog execution. Saved-file and direct-paste tests created no run logs. Install-folder permission repair was tested against the inherited ProgramData Users write grant and the explicitly copied legacy grant.
 
-The install-folder repair was tested on the same build against real folders with the inherited grant and the copied rule left by a failed upgrade.
+**Limitations:** The test host's Windows Event Log service was already disabled, preventing channel enumeration. Complete application of all Windows changes, automatic startup and sign-in runs, and tests on additional Windows builds remain open. These results do not establish that every setting works on every supported system.
 
-## Changes in 1.5.1
+[Microsoft's October 2026 Windows update](https://support.microsoft.com/en-us/servicing/os/windows-11/2026/10/kb5127648-windows-11-24h2-25h2-26h2-security-update)
 
-- Added a one-time prompt to review all optional service groups when an optional service, per-user instance, or template is already disabled.
-- Full review waits for a disable decision at all 11 groups. Declining full review keeps the pending-only walkthrough.
-- Answering `n` to a group during full review re-enables its disabled services and templates directly.
-- Restored the dual-purpose explanations for every group, including the distinction between Windows account sync and classic Outlook desktop.
-- Restored the colored banner, group headings, and status markers. Warnings are red and each phase shows whether it completed.
-- Removed file logging.
-- Fixed the install-folder upgrade for folders with the inherited ProgramData Users write grant or the explicit copy left by an earlier failed run. Setup verifies the restricted permissions before continuing.
+</details>
 
-## Changes in 1.5.0
+<details>
+<summary><strong>Release history</strong></summary>
 
-- Added local script persistence and direct paste from `naturalizer.ps1`.
-- Moved local file validation and watchdog registration before settings changes. The SYSTEM task uses the secured local copy, with startup and logon triggers, saved-task readback, and rollback on setup failure.
-- Added state checks for optional services, per-user templates, Defender cloud preferences, and Smart App Control.
-- Separated ETW boot configuration from provider changes and reported verified registry values and errors.
-- Rewrote prompts and cleanup warnings, and verified restore-point creation before reporting success. Moved the Event Log service prompt after watchdog setup.
-- Made `-WhatIf` exit before any changes and resolved firewall domains to IP addresses before configuring the optional rules.
+**v1.5.1**
 
-## ⚠️ Disclaimer
+- Added the full-review option for disabled optional service groups and explicit decisions across all 11 groups.
+- Added direct re-enabling with built-in startup types and restored detailed descriptions of dual-purpose services.
+- Restored colored console feedback, phase results, and the banner while removing run log files.
+- Fixed installation-directory permission repair for legacy ProgramData grants.
 
-Naturalizer makes system-wide changes to services, the registry, scheduled tasks, and optionally network traffic and existing logs. **Review the script before running it** and save your current configuration. Disabling services such as Windows Event Log can break diagnostics, auditing, and dependent applications. The script is provided as-is, with no warranty.
+**v1.5.0**
 
-## License
+- Added local source persistence for saved-file and direct-paste runs.
+- Moved validated watchdog installation before settings changes, with protected file storage and setup rollback.
+- Added state checks for optional services, per-user templates, Defender cloud settings, and Smart App Control.
+- Refined ETW verification, restore-point reporting, prompts, `-WhatIf`, and optional firewall DNS resolution.
 
-MIT. See [LICENSE](LICENSE).
+**Current `main`:** Also includes the later SmartScreen consent, Location-policy consistency, WER path, WMI allowlist, and watchdog exit-status corrections described above. The script still identifies itself as v1.5.1; these main-branch changes should not be assumed to exist in the original tagged release.
 
-## Author
+</details>
 
-**Emil Veliyev** · [github.com/emillvl](https://github.com/emillvl)
+## The book behind the project
 
-Companion book [Windows Never Forgets](https://github.com/emillvl/windows-never-forgets).
+**[Windows Never Forgets](https://github.com/emillvl/windows-never-forgets)** grew out of the investigation behind Naturalizer.
+
+Naturalizer is the tool that applies selected changes. The book explores the Windows services, policies, tracing systems, and forensic artifacts behind those decisions—what Windows records, why those mechanisms exist, and what controlling them can affect.
+
+## License & author
+
+Released under the [MIT License](LICENSE).
+
+**Emil Veliyev** · [GitHub](https://github.com/emillvl)
+
+---
+
+<div align="center">
+<sub>Read the source. Understand the trade-offs. Keep control of your system.</sub>
+</div>
