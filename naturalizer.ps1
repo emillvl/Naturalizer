@@ -98,7 +98,8 @@ function Initialize-NaturalizerDirectory {
     $parent = Split-Path -Parent $InstallDirectory
     $parentAcl = Get-NaturalizerPathAcl -Path $parent -Directory
     $parentControl = [int][Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
-    foreach ($rule in @(Get-NaturalizerUntrustedWriteRules $parentAcl)) {
+    $parentWriteRules = @(Get-NaturalizerUntrustedWriteRules $parentAcl)
+    foreach ($rule in $parentWriteRules) {
         if ([int]$rule.FileSystemRights -band ($parentControl -bor 0x10000000)) {
             throw "Standard users can alter protected directory entries under $parent."
         }
@@ -126,21 +127,49 @@ function Initialize-NaturalizerDirectory {
         return
     }
 
-    # Older installs can inherit the Users write grant from ProgramData.
-    $legacyRights = [int][Security.AccessControl.FileSystemRights]'Write, Synchronize'
+    $usersSid = 'S-1-5-32-545'
+    $write = [int][Security.AccessControl.FileSystemRights]::Write
+    $legacyMasks = @($write, ($write -bor [int][Security.AccessControl.FileSystemRights]::Synchronize))
+    $legacyParentMasks = @($parentWriteRules | Where-Object {
+        $_.IdentityReference.Value -eq $usersSid -and
+        [int]$_.FileSystemRights -in $legacyMasks -and
+        $_.InheritanceFlags -eq 'ContainerInherit' -and $_.PropagationFlags -eq 'None'
+    } | ForEach-Object { [int]$_.FileSystemRights })
+
+    # A failed older upgrade can leave the ProgramData grant copied into a protected ACL.
     foreach ($rule in $unsafeRules) {
-        if (-not $rule.IsInherited -or $rule.IdentityReference.Value -ne 'S-1-5-32-545' -or
-            ([int]$rule.FileSystemRights -band (-bnot $legacyRights))) {
+        if ($rule.IdentityReference.Value -ne $usersSid -or
+            [int]$rule.FileSystemRights -notin $legacyParentMasks -or
+            $rule.InheritanceFlags -ne 'ContainerInherit' -or $rule.PropagationFlags -ne 'None' -or
+            (-not $rule.IsInherited -and -not $acl.AreAccessRulesProtected)) {
             throw "Standard users have write access to $InstallDirectory. Review its permissions before running Naturalizer."
         }
     }
-    $acl.SetAccessRuleProtection($true, $true)
-    foreach ($rule in @(Get-NaturalizerUntrustedWriteRules $acl)) {
-        $acl.RemoveAccessRuleSpecific($rule)
+
+    # Edit the descriptor directly because the access-rule API cannot remove an inherited entry.
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+    $rules = $descriptor.DiscretionaryAcl
+    $withoutInherited = -bnot [int][Security.AccessControl.AceFlags]::Inherited
+    $containerInherit = [int][Security.AccessControl.AceFlags]::ContainerInherit
+    for ($i = $rules.Count - 1; $i -ge 0; $i--) {
+        $entry = $rules[$i]
+        if ($entry -is [Security.AccessControl.CommonAce] -and $entry.AceType -eq 'AccessAllowed' -and
+            $entry.SecurityIdentifier.Value -eq $usersSid -and $entry.AccessMask -in $legacyParentMasks -and
+            ([int]$entry.AceFlags -band $withoutInherited) -eq $containerInherit) {
+            $rules.RemoveAce($i)
+        }
     }
+    $bytes = [byte[]]::new($descriptor.BinaryLength)
+    $descriptor.GetBinaryForm($bytes, 0)
+    $acl.SetSecurityDescriptorBinaryForm($bytes, [Security.AccessControl.AccessControlSections]::Access)
+    $acl.SetAccessRuleProtection($true, $true)
+    if (@(Get-NaturalizerUntrustedWriteRules $acl).Count -gt 0) {
+        throw "Could not prepare safe permissions for $InstallDirectory."
+    }
+
     Set-Acl -LiteralPath $InstallDirectory -AclObject $acl -ErrorAction Stop
     $verifiedAcl = Get-NaturalizerPathAcl -Path $InstallDirectory -Directory
-    if (@(Get-NaturalizerUntrustedWriteRules $verifiedAcl).Count -gt 0) {
+    if (-not $verifiedAcl.AreAccessRulesProtected -or @(Get-NaturalizerUntrustedWriteRules $verifiedAcl).Count -gt 0) {
         throw "Could not restrict write access to $InstallDirectory."
     }
 }

@@ -125,7 +125,7 @@ Appends a clearly delimited `Naturalizer` block with `0.0.0.0` entries to the sy
 
 Naturalizer prepares the watchdog before the settings phases. It saves its running source at `C:\ProgramData\Naturalizer\naturalizer.ps1`. Saved-file runs use the original bytes. Pasted runs save the complete command as UTF-8 with a BOM and Windows line endings, without any switches passed for that run.
 
-Naturalizer compares the source and installed file by SHA-256 and leaves a matching file untouched. For a missing or different file, it validates a temporary copy, moves or atomically replaces the installed file, and verifies the installed hash. The install directory must restrict writes to trusted administrators and SYSTEM. Naturalizer rejects redirected paths and unsafe file permissions. On an older installation with standard ProgramData permissions, it removes the inherited Users write grant from the install directory.
+Naturalizer compares the source and installed file by SHA-256 and leaves a matching file untouched. For a missing or different file, it validates a temporary copy, moves or atomically replaces the installed file, and verifies the installed hash. The install directory must restrict writes to trusted administrators and SYSTEM. Naturalizer rejects redirected paths and unsafe file permissions. On older installations, Naturalizer removes the matching ProgramData Users write grant. This also covers the explicit copy of that rule left by a failed v1.5.0 or v1.5.1 upgrade.
 
 The `Naturalizer_Watchdog` task launches Windows PowerShell with a hidden window and `-NonInteractive`, using the verified absolute path and the internal `-Watchdog` switch. It runs as **SYSTEM at highest privileges**, at **startup and logon**. Naturalizer reads back the saved definition before continuing. If setup fails, it stops before changing Windows settings and attempts to restore the previous file and task when needed.
 
@@ -180,10 +180,14 @@ On **Windows 11 26H2 with the October 13, 2026 update (build 26300.9711)**, both
 
 On the same build, v1.5.1 tests in PowerShell 5.1 used simulated service states to check the review choices, first-run behavior, per-user services, and noninteractive watchdog execution.
 
+The install-folder repair was tested on the same build against real folders with the inherited grant and the copied rule left by a failed upgrade.
+
 ## Changes in 1.5.1
 
 - Added a one-time prompt to review all optional service groups when an optional service, per-user instance, or template is already disabled.
 - Full review shows completed groups in the usual order. Pending changes still require confirmation, and declining the review keeps the pending-only flow.
+
+- Fixed the install-folder upgrade for folders with the inherited ProgramData Users write grant or the explicit copy left by an earlier failed run. Setup verifies the restricted permissions before continuing.
 
 ## Changes in 1.5.0
 
