@@ -25,7 +25,7 @@
 
 <#
 .SYNOPSIS
-    Naturalizer 1.5.0 configures selected Windows diagnostics and telemetry settings.
+    Naturalizer 1.5.1 configures selected Windows diagnostics and telemetry settings.
 .PARAMETER BlockFirewall
     Add outbound firewall rules for the listed telemetry endpoints.
 .PARAMETER BlockHosts
@@ -240,7 +240,7 @@ function Set-VerifiedRegistryValue {
     }
 }
 
-Write-Log 'Naturalizer 1.5.0' HEAD
+Write-Log 'Naturalizer 1.5.1' HEAD
 Write-Log "Installed script path: $InstalledScript" -SilentConsole
 Write-Log "Log file: $LogFile" -SilentConsole
 
@@ -496,8 +496,11 @@ function Get-NaturalizerServiceState {
         if ($null -eq $Service.StartType -or $null -eq $Service.Status) {
             throw 'The startup type or running state was unavailable.'
         }
-        if ($Service.StartType -eq 'Disabled' -and $Service.Status -eq 'Stopped') {
-            return 'Disabled'
+        if ($Service.StartType -eq 'Disabled') {
+            if ($Service.Status -eq 'Stopped') {
+                return 'Disabled'
+            }
+            return 'StopOnly'
         }
         return 'Pending'
     }
@@ -526,7 +529,7 @@ function Disable-NaturalizerService {
     param([string]$Name, [string]$Description)
 
     $service = Get-NaturalizerService $Name
-    if ($null -eq $service -or (Get-NaturalizerServiceState $service) -ne 'Pending') {
+    if ($null -eq $service -or (Get-NaturalizerServiceState $service) -in @('Disabled', 'Unknown')) {
         return
     }
 
@@ -566,42 +569,49 @@ Disable-NaturalizerService 'AisSvc' 'AI Host Service'
 Disable-NaturalizerService 'PcaSvc' 'Program Compatibility Assistant'
 Disable-NaturalizerService 'SSDPSRV' 'SSDP Discovery / UPnP'
 
-function Invoke-DualNatureGroup {
-    param(
-        [string[]]$Services,
-        [string]$Label,
-        [string]$Description,
-        [string]$UserTemplatePrefix
-    )
+function Get-NaturalizerOptionalServiceState {
+    param([hashtable]$Group)
 
-    if ($Watchdog) {
-        return
-    }
-
-    $pendingServices = @(foreach ($name in $Services) {
+    $disabled = @()
+    $unavailable = @()
+    $pendingServices = @(foreach ($name in $Group['Services']) {
         $service = Get-NaturalizerService $name
-        if ($null -ne $service -and (Get-NaturalizerServiceState $service) -eq 'Pending') {
+        $state = if ($null -eq $service) { 'Unknown' } else { Get-NaturalizerServiceState $service }
+        if ($state -eq 'Unknown') {
+            $unavailable += $name
+            continue
+        }
+        if ($state -in @('Disabled', 'StopOnly')) {
+            $disabled += $name
+        }
+        if ($state -ne 'Disabled') {
             $name
         }
     })
 
+    $prefix = $Group['UserTemplatePrefix']
+    $templatePath = $null
     $templatePending = $false
     $instances = @()
-    if ($UserTemplatePrefix) {
-        $templatePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$UserTemplatePrefix"
+    if ($prefix) {
+        $templatePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$prefix"
         try {
             $start = Get-ItemPropertyValue -LiteralPath $templatePath -Name 'Start' -ErrorAction Stop
             if ($start -isnot [int]) {
                 throw 'The template Start value was unavailable or had an unexpected type.'
             }
             $templatePending = $start -ne 4
+            if (-not $templatePending) {
+                $disabled += "$prefix template"
+            }
         }
         catch {
-            Write-Log "Could not read service template $UserTemplatePrefix. $_" WARN -SilentConsole
+            $unavailable += "$prefix template"
+            Write-Log "Could not read service template $prefix. $_" WARN -SilentConsole
         }
 
-        # Windows uses the template for future logons. Existing instances can still be running.
-        $instances = @(foreach ($instance in @(Get-NaturalizerService "${UserTemplatePrefix}_*")) {
+        # The template applies at the next logon. Current instances can still be running.
+        $instances = @(foreach ($instance in @(Get-NaturalizerService "${prefix}_*")) {
             try {
                 if ($null -eq $instance.Status) {
                     throw 'The running state was unavailable.'
@@ -609,76 +619,156 @@ function Invoke-DualNatureGroup {
                 if ($instance.Status -ne 'Stopped') {
                     $instance
                 }
+                if ($instance.StartType -eq 'Disabled') {
+                    $disabled += $instance.Name
+                }
             }
             catch {
+                $unavailable += $instance.Name
                 Write-Log "Could not read the state of $($instance.Name). $_" WARN -SilentConsole
             }
         })
     }
 
-    $changes = @(foreach ($name in $pendingServices) { "stop and disable $name" })
-    if ($templatePending) {
-        $changes += "disable the $UserTemplatePrefix template"
+    [pscustomobject]@{
+        Disabled = $disabled
+        Unavailable = $unavailable
+        PendingServices = $pendingServices
+        TemplatePath = $templatePath
+        TemplatePending = $templatePending
+        Instances = $instances
     }
-    $changes += @(foreach ($instance in $instances) { "stop $($instance.Name)" })
-    if ($changes.Count -eq 0) {
+}
+
+function Invoke-DualNatureGroup {
+    param([hashtable]$Group, [switch]$Review)
+
+    # Read the current state when the group comes up, since other prompts may take time.
+    $state = Get-NaturalizerOptionalServiceState $Group
+    $changes = @(foreach ($name in $state.PendingServices) { "stop and disable $name" })
+    if ($state.TemplatePending) {
+        $changes += "disable the $($Group['UserTemplatePrefix']) template"
+    }
+    $changes += @(foreach ($instance in $state.Instances) { "stop $($instance.Name)" })
+    if ($changes.Count -eq 0 -and -not $Review) {
         return
     }
 
-    Write-Host "`n$Label"
-    Write-Host $Description
+    $label = $Group['Label']
+    Write-Host "`n$label"
+    Write-Host $Group['Description']
+    if ($Review) {
+        if ($state.Disabled.Count -gt 0) {
+            Write-Host "Already disabled ($($state.Disabled -join ', '))."
+        }
+        if ($state.Unavailable.Count -gt 0) {
+            Write-Host "Could not confirm the state of $($state.Unavailable -join ', ')."
+        }
+        if ($changes.Count -eq 0) {
+            Write-Host 'This group has no changes to apply.'
+            return
+        }
+    }
+
     Write-Host "This will $($changes -join ', ')."
     if ((Read-Host 'Apply these changes? [y/N]') -notmatch '^\s*y\s*$') {
-        Write-Log "Kept $Label by user choice." -SilentConsole
+        Write-Log "Kept $label by user choice." -SilentConsole
         return
     }
 
-    foreach ($name in $pendingServices) {
-        Disable-NaturalizerService -Name $name -Description $Label
+    foreach ($name in $state.PendingServices) {
+        Disable-NaturalizerService -Name $name -Description $label
     }
-    if ($templatePending) {
+    if ($state.TemplatePending) {
+        $prefix = $Group['UserTemplatePrefix']
         try {
-            Set-VerifiedRegistryValue -Path $templatePath -Name 'Start' -Value 4
-            Write-Log "Disabled service template $UserTemplatePrefix." -SilentConsole
+            Set-VerifiedRegistryValue -Path $state.TemplatePath -Name 'Start' -Value 4
+            Write-Log "Disabled service template $prefix." -SilentConsole
         }
         catch {
-            Write-Log "Could not disable service template $UserTemplatePrefix. $_" WARN
+            Write-Log "Could not disable service template $prefix. $_" WARN
         }
     }
-    foreach ($instance in $instances) {
+    foreach ($instance in $state.Instances) {
         Stop-NaturalizerService $instance
     }
 }
 
-Invoke-DualNatureGroup -Services 'lfsvc' -Label 'Location' `
-    -Description 'Windows uses location for maps, local weather, automatic time zones, and Find My Device. Disabling the service restricts apps that use Windows location and can stop those features from working. Apps may still estimate where you are from your IP address.'
+if (-not $Watchdog) {
+    $optionalServiceGroups = @(
+        @{
+            Services = 'lfsvc'
+            Label = 'Location'
+            Description = 'Windows uses location for maps, local weather, automatic time zones, and Find My Device. Disabling the service restricts apps that use Windows location and can stop those features from working. Apps may still estimate where you are from your IP address.'
+        }
+        @{
+            Services = @('SensorDataService', 'SensrSvc', 'SensorMonitorSvc')
+            Label = 'Device sensors'
+            Description = 'These services supply readings from sensors such as the accelerometer and ambient light sensor. Disabling them can stop automatic screen rotation and brightness and prevent apps from getting those readings through Windows.'
+        }
+        @{
+            Services = @('WdiServiceHost', 'WdiSystemHost')
+            Label = 'Windows diagnostic hosts'
+            Description = 'Windows uses these services to run troubleshooting routines that inspect system problems. Disabling them can stop automated diagnostics and repairs. Some troubleshooting routines use information about the device and the fault.'
+        }
+        @{
+            Services = 'CDPSvc'
+            UserTemplatePrefix = 'CDPUserSvc'
+            Label = 'Connected devices'
+            Description = 'These services help Windows share activity and communicate with nearby or linked devices. Disabling them can interfere with Phone Link, nearby sharing, and casting.'
+        }
+        @{
+            UserTemplatePrefix = 'OneSyncSvc'
+            Label = 'Mail, calendar, and contacts sync'
+            Description = 'Apps that use Windows account sync rely on this service to exchange mail, calendar, and contact data with your account provider. Disabling it can prevent those apps from receiving updates.'
+        }
+        @{
+            UserTemplatePrefix = 'cbdhsvc'
+            Label = 'Clipboard history'
+            Description = 'This service supports clipboard history (Win+V) and optional sync across devices. Sync can send clipboard contents to your account. Disabling the service can stop history and sync.'
+        }
+        @{
+            Services = 'WpnService'
+            UserTemplatePrefix = 'WpnUserService'
+            Label = 'Push notifications'
+            Description = 'Windows uses these services to deliver app notifications, including messages from the Windows Push Notification Service. Disabling them can stop notifications and badges from updating.'
+        }
+        @{
+            Services = @('XblAuthManager', 'XblGameSave', 'XboxNetApiSvc')
+            Label = 'Xbox services'
+            Description = 'Xbox services sign you in, sync game saves, and support multiplayer. Disabling them can break those features and interrupt sync with your Xbox account.'
+        }
+        @{
+            Services = 'MapsBroker'
+            Label = 'Offline maps'
+            Description = 'Windows checks for and downloads updates for saved offline maps. Disabling this service stops those updates, so saved maps can become outdated.'
+        }
+        @{
+            Services = 'DoSvc'
+            Label = 'Delivery Optimization'
+            Description = 'Delivery Optimization manages Windows and Microsoft Store downloads. Depending on your settings, it can exchange update data with other PCs. Disabling the service can affect updates and downloads.'
+        }
+    )
 
-Invoke-DualNatureGroup -Services @('SensorDataService', 'SensrSvc', 'SensorMonitorSvc') -Label 'Device sensors' `
-    -Description 'These services supply readings from sensors such as the accelerometer and ambient light sensor. Disabling them can stop automatic screen rotation and brightness and prevent apps from getting those readings through Windows.'
+    $eventLogGroup = @{
+        Services = 'EventLog'
+        Label = 'Windows Event Log (high impact)'
+        Description = 'Windows and apps use this service to record events for audits and troubleshooting. Disabling it can disrupt diagnostics, dependent services, and scheduled tasks, including the watchdog. Other components can read the local events it stores.'
+    }
 
-Invoke-DualNatureGroup -Services @('WdiServiceHost', 'WdiSystemHost') -Label 'Windows diagnostic hosts' `
-    -Description 'Windows uses these services to run troubleshooting routines that inspect system problems. Disabling them can stop automated diagnostics and repairs. Some troubleshooting routines use information about the device and the fault.'
+    $reviewOptionalServices = $false
+    foreach ($group in ($optionalServiceGroups + @($eventLogGroup))) {
+        if ((Get-NaturalizerOptionalServiceState $group).Disabled.Count -gt 0) {
+            Write-Host 'Some optional services are already disabled.'
+            $reviewOptionalServices = (Read-Host 'Review all optional service groups again? [y/N]') -match '^\s*y\s*$'
+            break
+        }
+    }
 
-Invoke-DualNatureGroup -Services 'CDPSvc' -UserTemplatePrefix 'CDPUserSvc' -Label 'Connected devices' `
-    -Description 'These services help Windows share activity and communicate with nearby or linked devices. Disabling them can interfere with Phone Link, nearby sharing, and casting.'
-
-Invoke-DualNatureGroup -UserTemplatePrefix 'OneSyncSvc' -Label 'Mail, calendar, and contacts sync' `
-    -Description 'Apps that use Windows account sync rely on this service to exchange mail, calendar, and contact data with your account provider. Disabling it can prevent those apps from receiving updates.'
-
-Invoke-DualNatureGroup -UserTemplatePrefix 'cbdhsvc' -Label 'Clipboard history' `
-    -Description 'This service supports clipboard history (Win+V) and optional sync across devices. Sync can send clipboard contents to your account. Disabling the service can stop history and sync.'
-
-Invoke-DualNatureGroup -Services 'WpnService' -UserTemplatePrefix 'WpnUserService' -Label 'Push notifications' `
-    -Description 'Windows uses these services to deliver app notifications, including messages from the Windows Push Notification Service. Disabling them can stop notifications and badges from updating.'
-
-Invoke-DualNatureGroup -Services @('XblAuthManager', 'XblGameSave', 'XboxNetApiSvc') -Label 'Xbox services' `
-    -Description 'Xbox services sign you in, sync game saves, and support multiplayer. Disabling them can break those features and interrupt sync with your Xbox account.'
-
-Invoke-DualNatureGroup -Services 'MapsBroker' -Label 'Offline maps' `
-    -Description 'Windows checks for and downloads updates for saved offline maps. Disabling this service stops those updates, so saved maps can become outdated.'
-
-Invoke-DualNatureGroup -Services 'DoSvc' -Label 'Delivery Optimization' `
-    -Description 'Delivery Optimization manages Windows and Microsoft Store downloads. Depending on your settings, it can exchange update data with other PCs. Disabling the service can affect updates and downloads.'
+    foreach ($group in $optionalServiceGroups) {
+        Invoke-DualNatureGroup -Group $group -Review:$reviewOptionalServices
+    }
+}
 
 # Optional security settings
 
@@ -1230,8 +1320,9 @@ if ($BlockHosts) {
 }
 
 # Task Scheduler and Event Log cleanup should finish before this optional service change.
-Invoke-DualNatureGroup -Services 'EventLog' -Label 'Windows Event Log (high impact)' `
-    -Description 'Windows and apps use this service to record events for audits and troubleshooting. Disabling it can disrupt diagnostics, dependent services, and scheduled tasks, including the watchdog. Other components can read the local events it stores.'
+if (-not $Watchdog) {
+    Invoke-DualNatureGroup -Group $eventLogGroup -Review:$reviewOptionalServices
+}
 
 Write-Log "Run finished. See $LogFile"
 } @args

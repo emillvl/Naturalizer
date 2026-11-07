@@ -6,7 +6,7 @@
 
 Run it once. The watchdog reapplies the default changes at startup and sign-in.
 
-[![version](https://img.shields.io/badge/version-1.5.0-blue)](https://github.com/emillvl/Naturalizer/releases/tag/v1.5.0)
+[![version](https://img.shields.io/badge/version-1.5.1-blue)](https://github.com/emillvl/Naturalizer/releases/tag/v1.5.1)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011%20%7C%20Server-0078D6)
 ![powershell](https://img.shields.io/badge/PowerShell-5.1-5391FE)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -83,7 +83,9 @@ If you edit the file, save it as UTF-8 with a BOM so Windows PowerShell 5.1 read
 
 **Dual-purpose services** are handled interactively. Naturalizer explains what they do and what may stop working if you disable them. The optional groups cover Geolocation (`lfsvc`), Sensors, WDI diagnostic hosts, Phone Link (`CDPSvc`/`CDPUserSvc`), Mail/Calendar sync (`OneSyncSvc`), Clipboard History (`cbdhsvc`), Push Notifications (`WpnService`/`WpnUserService`), Xbox services, Offline Maps (`MapsBroker`), Delivery Optimization (`DoSvc`), and **Windows Event Log (`EventLog`, high impact)**.
 
-Naturalizer skips a group when every applicable target already matches the requested state. If some services still need changes, the prompt lists only those services, templates, or running instances. Disabled per-user templates apply at future logons. The script stops the running instances listed in the prompt and logs unavailable or unreadable checks separately. [Microsoft documentation for per-user services](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows)
+When Naturalizer finds an optional service, per-user instance, or template already disabled, it asks **Review all optional service groups again? [y/N]** once. Answer `y` to see all groups in their usual order, including their descriptions and which targets are already disabled. Groups with pending changes still ask for confirmation.
+
+Press Enter or answer `n` to see only groups that need action. On a run where none of the optional services are disabled, Naturalizer goes straight to the pending groups. Disabled per-user templates apply at future logons. The script stops the running instances listed in the prompt and logs unavailable or unreadable checks separately. [Microsoft documentation for per-user services](https://learn.microsoft.com/en-us/windows/application-management/per-user-services-in-windows)
 
 **Microsoft Defender cloud protection** has an optional prompt for cloud reporting, automatic sample submission, and Block at First Sight. Naturalizer skips the prompt when all three preferences already match and verifies the preferences after a change. Operational protection depends on Defender and policy. **Smart App Control** has a separate optional prompt when its policy is On or in Evaluation. An Off policy skips the prompt. If the policy state is unknown, Naturalizer records it and skips the change. Both options can reduce protection. [Defender cloud settings](https://learn.microsoft.com/en-us/defender-endpoint/configure-block-at-first-sight-microsoft-defender-antivirus) · [Smart App Control](https://support.microsoft.com/en-us/windows/security/windows-security/app-browser-control-in-the-windows-security-app)
 
@@ -121,7 +123,7 @@ Appends a clearly delimited `Naturalizer` block with `0.0.0.0` entries to the sy
 
 ### Phase 8 — Boot-start watchdog
 
-Naturalizer 1.5.0 prepares the watchdog before the settings phases. It saves its running source at `C:\ProgramData\Naturalizer\naturalizer.ps1`. Saved-file runs use the original bytes. Pasted runs save the complete command as UTF-8 with a BOM and Windows line endings, without any switches passed for that run.
+Naturalizer prepares the watchdog before the settings phases. It saves its running source at `C:\ProgramData\Naturalizer\naturalizer.ps1`. Saved-file runs use the original bytes. Pasted runs save the complete command as UTF-8 with a BOM and Windows line endings, without any switches passed for that run.
 
 Naturalizer compares the source and installed file by SHA-256 and leaves a matching file untouched. For a missing or different file, it validates a temporary copy, moves or atomically replaces the installed file, and verifies the installed hash. The install directory must restrict writes to trusted administrators and SYSTEM. Naturalizer rejects redirected paths and unsafe file permissions. On an older installation with standard ProgramData permissions, it removes the inherited Users write grant from the install directory.
 
@@ -174,7 +176,14 @@ Deleted Event Logs and diagnostic files require a backup for recovery.
 
 Windows 10 and supported Windows 11 releases, including Windows 11 26H2, are the compatibility targets. Use Windows PowerShell 5.1.
 
-On **Windows 11 26H2 with the October 13, 2026 update (build 26300.9711)**, both entry points passed PowerShell 5.1 tests. The tests covered exact source persistence, prompt suppression, and stopping before settings changes when setup fails. An isolated watchdog passed startup and logon trigger readback and ran on demand as SYSTEM. The host's Event Log service was already disabled, so channel enumeration failed. Full application of Windows settings, automatic startup and sign-in runs, and tests on other builds remain open. [Microsoft's October update](https://support.microsoft.com/en-us/servicing/os/windows-11/2026/10/kb5127648-windows-11-24h2-25h2-26h2-security-update)
+On **Windows 11 26H2 with the October 13, 2026 update (build 26300.9711)**, both v1.5.0 entry points passed PowerShell 5.1 tests. The tests covered exact source persistence, prompt suppression, and stopping before settings changes when setup fails. An isolated watchdog passed startup and logon trigger readback and ran on demand as SYSTEM. The host's Event Log service was already disabled, so channel enumeration failed. Full application of Windows settings, automatic startup and sign-in runs, and tests on other builds remain open. [Microsoft's October update](https://support.microsoft.com/en-us/servicing/os/windows-11/2026/10/kb5127648-windows-11-24h2-25h2-26h2-security-update)
+
+On the same build, v1.5.1 tests in PowerShell 5.1 used simulated service states to check the review choices, first-run behavior, per-user services, and noninteractive watchdog execution.
+
+## Changes in 1.5.1
+
+- Added a one-time prompt to review all optional service groups when an optional service, per-user instance, or template is already disabled.
+- Full review shows completed groups in the usual order. Pending changes still require confirmation, and declining the review keeps the pending-only flow.
 
 ## Changes in 1.5.0
 
