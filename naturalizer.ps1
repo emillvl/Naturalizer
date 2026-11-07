@@ -215,6 +215,7 @@ if (-not $Watchdog) {
 }
 
 $runId = [guid]::NewGuid().ToString('N')
+$run = @{ Failed = $false }
 $phase = $null
 
 function Write-NaturalizerStatus {
@@ -224,8 +225,11 @@ function Write-NaturalizerStatus {
         [string]$Level = 'INFO'
     )
 
-    if ($null -ne $phase -and $Level -in @('WARN', 'ERROR')) {
-        $phase.Failed = $true
+    if ($Level -in @('WARN', 'ERROR')) {
+        $run.Failed = $true
+        if ($null -ne $phase) {
+            $phase.Failed = $true
+        }
     }
     if ($Watchdog) {
         return
@@ -247,7 +251,14 @@ function Invoke-NaturalizerPhase {
     Write-NaturalizerStatus $Title HEAD
     $phase = @{ Failed = $false }
     try {
-        & $Work
+        if ($Watchdog) {
+            $ErrorActionPreference = 'Stop'
+            $ProgressPreference = 'SilentlyContinue'
+            & $Work *> $null
+        }
+        else {
+            & $Work
+        }
     }
     catch {
         Write-NaturalizerStatus $_.Exception.Message ERROR
@@ -329,7 +340,21 @@ function Set-VerifiedRegistryValue {
     param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
 
     Set-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
-    $actual = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+    if ($Type -eq 'ExpandString') {
+        $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+        try {
+            if ($key.GetValueKind($Name) -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                throw "Expected an expandable string for $Name at $Path."
+            }
+            $actual = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+        finally {
+            $key.Dispose()
+        }
+    }
+    else {
+        $actual = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+    }
     if ($null -eq $actual -or ($Type -eq 'DWord' -and $actual -isnot [int]) -or $actual -cne $Value) {
         throw "Readback of $Name at $Path returned '$actual'. Expected '$Value'."
     }
@@ -815,6 +840,9 @@ function Invoke-DualNatureGroup {
     }
 
     $label = $Group['Label']
+    if ($label -eq 'Location') {
+        $changes += 'turn off Windows location access, location scripting, and location-aware search'
+    }
     Write-NaturalizerSection $label
     Write-NaturalizerRow '[*] Real function' $Group['Purpose']
     Write-NaturalizerRow '[!] If disabled' $Group['Impact'] Red
@@ -833,12 +861,15 @@ function Invoke-DualNatureGroup {
     }
 
     if ($Review) {
-        if ($state.DisabledServices.Count -gt 0 -or $state.TemplateDisabled) {
+        if ($label -eq 'Location') {
+            Write-NaturalizerRow '[<] If you choose N' 'Re-enable the service if disabled, turn Windows location access back on if it is off, and clear the corresponding local policy blocks.' Cyan
+        }
+        elseif ($state.DisabledServices.Count -gt 0 -or $state.TemplateDisabled) {
             Write-NaturalizerRow '[<] If you choose N' 'Re-enable the disabled services and templates in this group.' Cyan
         }
         if ((Read-NaturalizerChoice 'Disable this group? [Y/N]') -eq 'N') {
             Enable-NaturalizerOptionalGroup -Group $Group -State $state
-            return
+            return 'Enable'
         }
         if ($changes.Count -eq 0) {
             Write-NaturalizerRow '[-] Changes' 'No pending actions for this group.' DarkGray
@@ -865,8 +896,10 @@ function Invoke-DualNatureGroup {
     foreach ($instance in $state.Instances) {
         Stop-NaturalizerService $instance
     }
+    return 'Disable'
 }
 
+$locationAction = $null
 if (-not $Watchdog) {
     # Re-enable disabled targets with the service startup types documented by Microsoft.
     $optionalServiceGroups = @(
@@ -970,7 +1003,10 @@ if (-not $Watchdog) {
     }
 
     foreach ($group in $optionalServiceGroups) {
-        Invoke-DualNatureGroup -Group $group -Review:$reviewOptionalServices
+        $action = Invoke-DualNatureGroup -Group $group -Review:$reviewOptionalServices
+        if ($group['Label'] -eq 'Location') {
+            $locationAction = $action
+        }
     }
 }
 
@@ -1087,6 +1123,15 @@ function Invoke-SmartAppControlPrompt {
 Invoke-DefenderCloudPrompt
 Invoke-SmartAppControlPrompt
 
+$disableSmartScreen = $false
+if (-not $Watchdog) {
+    Write-NaturalizerSection 'Microsoft Defender SmartScreen'
+    Write-NaturalizerRow '[*] Real function' 'Windows uses SmartScreen to check the reputation of downloaded apps and files before they run.'
+    Write-NaturalizerRow '[!] If disabled' 'Windows can stop warning you before you open potentially malicious or unrecognized downloads.' Red
+    Write-NaturalizerRow '[*] Privacy angle' 'SmartScreen can send file reputation data, such as the file hash and digital signature, to Microsoft.' Red
+    $disableSmartScreen = (Read-Host '     [?] Turn off SmartScreen for apps and files? [y/N]') -match '^\s*y\s*$'
+}
+
 # Scheduled tasks
 
 function Disable-NaturalizerTask {
@@ -1162,38 +1207,45 @@ function Remove-NaturalizerWmiObject {
 
 function Remove-DiagnosticWmiSubscriptions {
     $namespace = 'root\subscription'
-    $pattern = '(?i)(diagnos|diagtrack|telemetry|watson|windows\s*error\s*report|\bwer\b|sqm|devicecensus|dmclient|feedback|compatibility\s*appraiser|programdataupdater)'
+    # The legacy build verification registration documented in Microsoft KB 2545227.
+    $allowlist = @{
+        FilterPath = '__EventFilter.Name="BVTFilter"'
+        EventNamespace = 'root\cimv2'
+        Query = 'SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA "Win32_Processor" AND TargetInstance.LoadPercentage > 99'
+        ConsumerPath = 'CommandLineEventConsumer.Name="BVTConsumer"'
+        CommandLine = 'cscript KernCap.vbs'
+        WorkingDirectories = @('C:\tools\kernrate', 'C:\\tools\\kernrate')
+    }
 
     try {
         $filters = @(Get-WmiObject -Namespace $namespace -Class __EventFilter -ErrorAction Stop)
         $consumers = @(Get-WmiObject -Namespace $namespace -Class __EventConsumer -ErrorAction Stop)
         $bindings = @(Get-WmiObject -Namespace $namespace -Class __FilterToConsumerBinding -ErrorAction Stop)
 
-        $targetFilters = @($filters | Where-Object {
-            (@($_.Name, $_.Query, $_.EventNamespace) -join ' ') -match $pattern
-        })
-        $targetConsumers = @($consumers | Where-Object {
-            $props = @($_.Properties | ForEach-Object { $_.Value })
-            ((@($_.Name) + $props) -join ' ') -match $pattern
-        })
-        $targetPaths = @(($targetFilters + $targetConsumers) | ForEach-Object { $_.__RELPATH })
-
-        # Remove bindings first so the filter and consumer objects are no longer referenced.
-        foreach ($binding in $bindings) {
-            $bindingText = "$($binding.Filter) $($binding.Consumer)"
-            $matchesTarget = $bindingText -match $pattern
-            foreach ($path in $targetPaths) {
-                if ($path -and $bindingText.IndexOf($path, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    $matchesTarget = $true
-                    break
-                }
-            }
-            if ($matchesTarget) {
-                Remove-NaturalizerWmiObject $binding
-            }
+        $filter = $filters | Where-Object {
+            $_.__RELPATH -eq $allowlist.FilterPath -and $_.EventNamespace -eq $allowlist.EventNamespace -and
+            $_.QueryLanguage -eq 'WQL' -and $_.Query -eq $allowlist.Query
         }
-        foreach ($object in ($targetConsumers + $targetFilters)) {
-            Remove-NaturalizerWmiObject $object
+        $consumer = $consumers | Where-Object {
+            $_.__RELPATH -eq $allowlist.ConsumerPath -and $_.CommandLineTemplate -eq $allowlist.CommandLine -and
+            -not $_.ExecutablePath -and $_.WorkingDirectory -in $allowlist.WorkingDirectories
+        }
+        $targetBindings = @(
+            if ($null -ne $filter -and $null -ne $consumer) {
+                $filterPaths = @($filter.__RELPATH, $filter.__PATH, "${namespace}:$($filter.__RELPATH)", "\\.\${namespace}:$($filter.__RELPATH)")
+                $consumerPaths = @($consumer.__RELPATH, $consumer.__PATH, "${namespace}:$($consumer.__RELPATH)", "\\.\${namespace}:$($consumer.__RELPATH)")
+                $bindings | Where-Object { $_.Filter -in $filterPaths -and $_.Consumer -in $consumerPaths }
+            }
+        )
+
+        # Remove matching bindings first. Keep objects still used by any subscription.
+        foreach ($binding in $targetBindings) {
+            Remove-NaturalizerWmiObject $binding
+        }
+        foreach ($object in @($consumer, $filter)) {
+            if ($null -ne $object -and @($object.PSBase.GetRelationships('__FilterToConsumerBinding')).Count -eq 0) {
+                Remove-NaturalizerWmiObject $object
+            }
         }
     }
     catch {
@@ -1230,18 +1282,54 @@ Invoke-NaturalizerPhase 'Applying registry policies' {
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'LimitDiagnosticLogCollection' 1
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'DoNotShowFeedbackNotifications' 1
     Set-Reg 'HKLM:\SYSTEM\CurrentControlSet\Services\DiagTrack' 'Start' 4
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 0
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' 'String'
+    if ($disableSmartScreen) {
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableSmartScreen' 0
+        Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer' 'SmartScreenEnabled' 'Off' 'String'
+    }
     Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0
     Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'DisabledByGroupPolicy' 1
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo' 'DisabledByGroupPolicy' 1
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors' 'DisableLocation' 1
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors' 'DisableLocationScripting' 1
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'String'
+    if ($locationAction -in @('Disable', 'Enable')) {
+        $locationSettings = @(
+            @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors', 'DisableLocation', 1, 'DWord', $null),
+            @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors', 'DisableLocationScripting', 1, 'DWord', $null),
+            @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location', 'Value', 'Deny', 'String', 'Allow'),
+            @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search', 'AllowSearchToUseLocation', 0, 'DWord', $null)
+        )
+        foreach ($setting in $locationSettings) {
+            $path, $name, $blockedValue, $type, $enabledValue = $setting
+            if ($locationAction -eq 'Disable') {
+                Set-Reg $path $name $blockedValue $type
+                continue
+            }
+
+            try {
+                if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+                    continue
+                }
+                $current = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).PSObject.Properties[$name]
+                if ($null -eq $current -or $current.Value -isnot ($blockedValue.GetType()) -or
+                    $current.Value -ne $blockedValue) {
+                    continue
+                }
+                if ($null -ne $enabledValue) {
+                    Set-Reg $path $name $enabledValue $type
+                }
+                else {
+                    Remove-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop
+                    if ($null -ne (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).PSObject.Properties[$name]) {
+                        throw 'The blocking value is still present.'
+                    }
+                }
+            }
+            catch {
+                Write-NaturalizerStatus "Could not restore location setting $path\$name. $_" WARN
+            }
+        }
+    }
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowCortana' 0
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'ConnectedSearchUseWeb' 0
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowCortanaAboveLock' 0
-    Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowSearchToUseLocation' 0
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search' 'DisableWebSearch' 1
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableActivityFeed' 0
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'PublishUserActivities' 0
@@ -1251,7 +1339,7 @@ Invoke-NaturalizerPhase 'Applying registry policies' {
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' 'Disabled' 1
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' 'DontSendAdditionalData' 1
     Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting' 'LoggingDisabled' 1
-    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' 'DumpFolder' "$env:LOCALAPPDATA\CrashDumps" 'ExpandString'
+    Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' 'DumpFolder' '%LOCALAPPDATA%\CrashDumps' 'ExpandString'
     Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' 'DumpType' 1
     Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps' 'DumpCount' 10
     Set-Reg 'HKCU:\SOFTWARE\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
@@ -1521,8 +1609,11 @@ if ($BlockHosts) {
 
 # Task Scheduler and Event Log cleanup should finish before this optional service change.
 if (-not $Watchdog) {
-    Invoke-DualNatureGroup -Group $eventLogGroup -Review:$reviewOptionalServices
+    Invoke-DualNatureGroup -Group $eventLogGroup -Review:$reviewOptionalServices | Out-Null
 }
 
+if ($Watchdog -and $run.Failed) {
+    exit 1
+}
 Write-NaturalizerStatus 'Run finished.' HEAD
 } @args

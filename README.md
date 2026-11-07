@@ -101,15 +101,19 @@ Disables the telemetry and diagnostic tasks targeted by the script, including Co
 
 ### Phase 3B — WMI diagnostic subscriptions
 
-Removes `__EventFilter`, `__EventConsumer`, and `__FilterToConsumerBinding` objects in `root\subscription` that match the script's diagnostic and telemetry patterns. It removes bindings before filters and consumers.
+Inventories filters, consumers, and bindings in `root\subscription`. The allowlist identifies the legacy Windows build-verification filter `BVTFilter` and consumer `BVTConsumer` by their exact identities and configuration. Naturalizer removes matching bindings first and keeps any filter or consumer still referenced by a binding. [Microsoft KB 2545227](https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/event-10-is-logged-in-application-log)
 
 ### Phase 4 — Registry policies
 
-Writes policy values for data collection, Cortana and web search, activity feed and timeline, advertising ID, location and sensors, input personalization and speech, error reporting, preview builds, content delivery and consumer features, Delivery Optimization, and Windows AI data analysis. The targets include SmartScreen policies that can turn off warnings about unsafe apps and downloads. Naturalizer reads the values back and logs errors it encounters.
+Writes policy values for data collection, Cortana and web search, activity feed and timeline, advertising ID, input personalization and speech, error reporting, preview builds, content delivery and consumer features, Delivery Optimization, and Windows AI data analysis. Naturalizer reads the values back and reports errors in the interactive console. The crash-dump folder uses the expandable path `%LOCALAPPDATA%\CrashDumps`. [Windows Error Reporting dump settings](https://learn.microsoft.com/en-us/windows/win32/wer/collecting-user-mode-dumps)
+
+Naturalizer turns off **SmartScreen for apps and files** only after an explicit `y`. The prompt explains the warnings you lose and the file reputation data SmartScreen can send to Microsoft. [Microsoft Defender SmartScreen](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)
+
+The **Location** prompt also controls the registry settings for Windows location access, location scripting, and location-aware search. Answering `n` during full review re-enables the service if needed, clears matching local policy blocks, and switches the machine-wide location setting from Deny to Allow if it is off. Declining in the pending-only walkthrough preserves the current registry settings.
 
 ### Phase 5 — ETW AutoLogger sessions
 
-Checks boot start for `AutoLogger-Diagtrack-Listener`, `SQMLogger`, `DiagLog`, and `NOISY`. The parent `Start` value controls whether the session starts at the next boot. Naturalizer verifies this value and logs provider `Enabled` changes separately. It skips provider writes on later runs when boot start is already off.
+Checks boot start for `AutoLogger-Diagtrack-Listener`, `SQMLogger`, `DiagLog`, and `NOISY`. The parent `Start` value controls whether the session starts at the next boot. Naturalizer verifies this value and reports errors updating provider `Enabled` values separately. It skips provider writes on later runs when boot start is already off.
 
 Use `logman query -ets` from an elevated prompt to check which sessions are running now. [Microsoft AutoLogger documentation](https://learn.microsoft.com/en-us/windows/win32/etw/configuring-and-starting-an-autologger-session)
 
@@ -133,7 +137,7 @@ Naturalizer compares the source and installed file by SHA-256 and leaves a match
 
 The `Naturalizer_Watchdog` task launches Windows PowerShell with a hidden window and `-NonInteractive`, using the verified absolute path and the internal `-Watchdog` switch. It runs as **SYSTEM at highest privileges**, at **startup and logon**. Naturalizer reads back the saved definition before continuing. If setup fails, it stops before changing Windows settings and attempts to restore the previous file and task when needed.
 
-The watchdog reapplies the default changes and skips restore points, optional prompts, and destructive cleanup. Firewall and hosts-file switches apply to the normal run that requests them. In watchdog mode, `HKCU` refers to SYSTEM's registry hive.
+The watchdog reapplies the default changes and skips restore points, optional prompts, SmartScreen and Location changes, and the optional cleanup of existing logs and diagnostic files. Firewall and hosts-file switches apply to the normal run that requests them. In watchdog mode, `HKCU` refers to SYSTEM's registry hive.
 
 #### Check registration and execution
 
@@ -156,7 +160,7 @@ Start-ScheduledTask -TaskPath '\' -TaskName Naturalizer_Watchdog
 Get-ScheduledTaskInfo -TaskPath '\' -TaskName Naturalizer_Watchdog
 ```
 
-Check `LastRunTime` and `LastTaskResult` after the task finishes. Restart and sign in separately to exercise the automatic triggers.
+Check `LastRunTime` and `LastTaskResult` after the task finishes. The watchdog exits with code `1` if a settings phase fails and `0` if the run succeeds. Restart and sign in separately to exercise the automatic triggers.
 
 ## Console output
 
