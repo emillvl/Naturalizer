@@ -1,28 +1,39 @@
-﻿#Requires -RunAsAdministrator
+﻿& {
+    $main = $args[0]
+    $forwarded = [Collections.Generic.List[object]]::new($args)
+    $forwarded.RemoveAt(0)
+    $named = @{}
+
+    # Windows PowerShell 5.1 splits arguments such as -WhatIf:$false into two tokens.
+    for ($i = 0; $i -lt $forwarded.Count;) {
+        $argument = $forwarded[$i]
+        if ($argument -is [string] -and $argument -match '^-(?<Name>[\w-]+):$' -and $i + 1 -lt $forwarded.Count) {
+            $named.Add($Matches.Name, $forwarded[$i + 1])
+            $forwarded.RemoveRange($i, 2)
+        }
+        else {
+            $i++
+        }
+    }
+
+    $remaining = $forwarded.ToArray()
+    & $main @named @remaining
+} {
 #Requires -Version 5.1
+#Requires -PSEdition Desktop
+#Requires -RunAsAdministrator
+
 <#
 .SYNOPSIS
-    Naturalizer.ps1 — Permanently kills Windows telemetry, behavioral profiling,
-    and data collection. Run once. They don't come back.
-.DESCRIPTION
-    Phase 1  — Stop + disable pure-spy services (silent)
-    Phase 2  — Dual-nature services (interactive prompt)
-    Phase 3  — Disable scheduled tasks (silent)
-    Phase 4  — Registry policies (silent)
-    Phase 5  — ETW AutoLogger sessions (silent)
-    Phase 6  — Windows Firewall outbound blocks      [-BlockFirewall]
-    Phase 7  — Hosts file null-route                 [-BlockHosts]
-    Phase 8  — Boot-Start Watchdog setup (Dual-Trigger)
+    Naturalizer 1.5.0 configures selected Windows diagnostics and telemetry settings.
 .PARAMETER BlockFirewall
-    Also add Windows Firewall outbound block rules for telemetry endpoints.
+    Add outbound firewall rules for the listed telemetry endpoints.
 .PARAMETER BlockHosts
-    Also null-route telemetry domains in the system hosts file.
+    Add the listed domains to the hosts file.
 .PARAMETER SkipRestorePoint
-    Skip creating a System Restore Point before making changes.
+    Skip the attempt to create a restore point.
 .PARAMETER Watchdog
-    Internal parameter used by the scheduled task to bypass interactive prompts on boot.
-.NOTES
-    Safe to re-run (idempotent). Re-run after any major Windows feature update.
+    Internal switch for noninteractive startup and logon runs.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -31,278 +42,782 @@ param(
     [switch]$SkipRestorePoint,
     [switch]$Watchdog
 )
+
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Continue'
 
-# BANNER & INIT
+# An interactive paste also needs the version and administrator checks.
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion -lt [version]'5.1') {
+    throw 'Run Naturalizer in Windows PowerShell 5.1.'
+}
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Open Windows PowerShell as administrator and run Naturalizer again.'
+}
+if (-not $PSCmdlet.ShouldProcess('this Windows installation', 'Apply Naturalizer settings')) {
+    return
+}
+# Optional changes have their own confirmation prompts.
+$ConfirmPreference = 'None'
 
-$banner = @'
-        _   __      __                   ___                
-   / | / /___ _/ /___  ___________ _/ (_)___  ___  _____
-  /  |/ / __ `/ __/ / / / ___/ __ `/ / /_  / / _ \/ ___/
- / /|  / /_/ / /_/ /_/ / /  / /_/ / / / / /_/  __/ /    
-/_/ |_/\__,_/\__/\__,_/_/   \__,_/_/_/ /___/\___/_/     
-                      v 1.0.0                                  
-'@
-if (-not $Watchdog) { Write-Host $banner -ForegroundColor Red }
+$InstallDirectory = 'C:\ProgramData\Naturalizer'
+$InstalledScript = Join-Path $InstallDirectory 'naturalizer.ps1'
+$trustedSids = @('S-1-5-18', 'S-1-5-32-544', $identity.User.Value)
 
-# LOGGING
+function Get-NaturalizerPathAcl {
+    param([string]$Path, [switch]$Directory)
 
-$LogFile = "$PSScriptRoot\Naturalizer_$(Get-Date -f 'yyyyMMdd_HHmmss').log"
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -ne $Directory.IsPresent -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Expected a local $(if ($Directory) { 'directory' } else { 'file' }) at $Path."
+    }
+
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $trustedSids) {
+        throw "Naturalizer cannot trust the owner of $Path."
+    }
+    return $acl
+}
+
+function Get-NaturalizerUntrustedWriteRules {
+    param($Acl)
+
+    $writeRights = [Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    # The generic write and generic all masks can occur in inherited ACLs.
+    $writeMask = [int]$writeRights -bor 0x50000000
+    $Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and
+        $_.IdentityReference.Value -notin $trustedSids -and
+        -not ($_.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+        ([int]$_.FileSystemRights -band $writeMask)
+    }
+}
+
+function Initialize-NaturalizerDirectory {
+    $parent = Split-Path -Parent $InstallDirectory
+    $parentAcl = Get-NaturalizerPathAcl -Path $parent -Directory
+    $parentControl = [int][Security.AccessControl.FileSystemRights]'Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    foreach ($rule in @(Get-NaturalizerUntrustedWriteRules $parentAcl)) {
+        if ([int]$rule.FileSystemRights -band ($parentControl -bor 0x10000000)) {
+            throw "Standard users can alter protected directory entries under $parent."
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $InstallDirectory -ErrorAction Stop)) {
+        $security = [Security.AccessControl.DirectorySecurity]::new()
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+            $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new($sid),
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+            $security.AddAccessRule($rule)
+        }
+        [IO.Directory]::CreateDirectory($InstallDirectory, $security) | Out-Null
+    }
+
+    $acl = Get-NaturalizerPathAcl -Path $InstallDirectory -Directory
+    $unsafeRules = @(Get-NaturalizerUntrustedWriteRules $acl)
+    if ($unsafeRules.Count -eq 0) {
+        return
+    }
+
+    # Older installs can inherit the Users write grant from ProgramData.
+    $legacyRights = [int][Security.AccessControl.FileSystemRights]'Write, Synchronize'
+    foreach ($rule in $unsafeRules) {
+        if (-not $rule.IsInherited -or $rule.IdentityReference.Value -ne 'S-1-5-32-545' -or
+            ([int]$rule.FileSystemRights -band (-bnot $legacyRights))) {
+            throw "Standard users have write access to $InstallDirectory. Review its permissions before running Naturalizer."
+        }
+    }
+    $acl.SetAccessRuleProtection($true, $true)
+    foreach ($rule in @(Get-NaturalizerUntrustedWriteRules $acl)) {
+        $acl.RemoveAccessRuleSpecific($rule)
+    }
+    Set-Acl -LiteralPath $InstallDirectory -AclObject $acl -ErrorAction Stop
+    $verifiedAcl = Get-NaturalizerPathAcl -Path $InstallDirectory -Directory
+    if (@(Get-NaturalizerUntrustedWriteRules $verifiedAcl).Count -gt 0) {
+        throw "Could not restrict write access to $InstallDirectory."
+    }
+}
+
+if (-not $Watchdog) {
+    # The file is one command. Its literal script block keeps the pasted source in the parser.
+    $body = $MyInvocation.MyCommand.ScriptBlock.Ast
+    if ($body.Parent -isnot [Management.Automation.Language.ScriptBlockExpressionAst]) {
+        throw 'Copy and paste the entire naturalizer.ps1 file as one block.'
+    }
+    $entry = $body.Parent.Parent
+    if ($entry -isnot [Management.Automation.Language.CommandAst] -or
+        $entry.CommandElements.Count -lt 3 -or $entry.CommandElements[2].Extent.Text -cne '@args') {
+        throw 'Copy and paste the entire naturalizer.ps1 file as one block.'
+    }
+
+    $encoding = [Text.UTF8Encoding]::new($true, $true)
+    $sourcePath = $entry.Extent.File
+    if ($sourcePath) {
+        $SourceBytes = [IO.File]::ReadAllBytes($sourcePath)
+        $source = $encoding.GetString($SourceBytes)
+        if ($source.StartsWith([string][char]0xFEFF, [StringComparison]::Ordinal)) {
+            $source = $source.Substring(1)
+        }
+
+        $scriptAst = $entry
+        while ($scriptAst.Parent) {
+            $scriptAst = $scriptAst.Parent
+        }
+        if ($source -cne $scriptAst.Extent.Text) {
+            throw 'The source file changed after PowerShell loaded it. Run the saved file again.'
+        }
+    }
+    else {
+        # End at @args so switches supplied for this run stay out of the installed script.
+        $length = $entry.CommandElements[2].Extent.EndOffset - $entry.Extent.StartOffset
+        $source = $entry.Extent.Text.Substring(0, $length)
+        $source = ($source -replace '\r\n?|\n', "`r`n") + "`r`n"
+        [byte[]]$SourceBytes = $encoding.GetPreamble() + $encoding.GetBytes($source)
+    }
+
+    Initialize-NaturalizerDirectory
+}
+
+$runMode = if ($Watchdog) { 'Watchdog' } else { 'Interactive' }
+$runStamp = Get-Date -Format 'yyyyMMdd_HHmmss_fff'
+$runId = [guid]::NewGuid().ToString('N')
+$LogFile = Join-Path $InstallDirectory "Naturalizer_${runMode}_${runStamp}_${runId}.log"
+
 function Write-Log {
     param(
         [string]$Message,
-        [ValidateSet('INFO','WARN','ERROR','HEAD')][string]$Level = 'INFO',
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'HEAD')]
+        [string]$Level = 'INFO',
         [switch]$SilentConsole
     )
-    $ts    = Get-Date -f 'HH:mm:ss'
-    $entry = "[$ts][$Level] $Message"
-    if (-not $SilentConsole -and -not $Watchdog) {
-        $color = switch ($Level) {
-            'HEAD'  { 'Magenta' }
-            'WARN'  { 'Yellow'  }
-            'ERROR' { 'Red'     }
-            default { 'Cyan'    }
-        }
-        Write-Host $entry -ForegroundColor $color
-    }
-    Add-Content -Path $LogFile -Value $entry -ErrorAction SilentlyContinue
-}
-Write-Log "Naturalizer initialized. Log: $LogFile" HEAD -SilentConsole
 
-# RESTORE POINT
+    $entry = "[$(Get-Date -Format 'HH:mm:ss')][$runMode][$Level] $Message"
+    if (-not $Watchdog -and -not $SilentConsole) {
+        $color = switch ($Level) {
+            'HEAD'  { 'White' }
+            'WARN'  { 'Yellow' }
+            'ERROR' { 'Red' }
+            default { 'Gray' }
+        }
+        Write-Host $Message -ForegroundColor $color
+    }
+    Add-Content -LiteralPath $LogFile -Value $entry -Encoding UTF8 -ErrorAction Stop
+}
+
+function Invoke-NaturalizerNative {
+    param([string]$Executable, [string[]]$Arguments)
+
+    # In Windows PowerShell, redirected native stderr can become error records.
+    $ErrorActionPreference = 'Continue'
+    if (-not [IO.Path]::IsPathRooted($Executable)) {
+        $Executable = Join-Path $env:SystemRoot "System32\$Executable"
+    }
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf -ErrorAction Stop)) {
+        throw "Windows command was not found at $Executable."
+    }
+    $output = @(& $Executable @Arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$Executable exited with code $exitCode. $($output -join ' ')"
+    }
+    return $output
+}
+
+function Set-VerifiedRegistryValue {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
+
+    Set-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
+    $actual = Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop
+    if ($null -eq $actual -or ($Type -eq 'DWord' -and $actual -isnot [int]) -or $actual -cne $Value) {
+        throw "Readback of $Name at $Path returned '$actual'. Expected '$Value'."
+    }
+}
+
+Write-Log 'Naturalizer 1.5.0' HEAD
+Write-Log "Installed script path: $InstalledScript" -SilentConsole
+Write-Log "Log file: $LogFile" -SilentConsole
+
+# Startup and logon watchdog
+
+function Assert-NaturalizerScriptFile {
+    param([string]$Path, [string]$ExpectedHash)
+
+    $acl = Get-NaturalizerPathAcl -Path $Path
+    if (@(Get-NaturalizerUntrustedWriteRules $acl).Count -gt 0) {
+        throw "Standard users have write access to $Path."
+    }
+    $actualHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($actualHash -ne $ExpectedHash) {
+        throw "SHA-256 verification failed for $Path."
+    }
+}
+
+function Get-NaturalizerWatchdog {
+    param([string]$TaskName)
+
+    try {
+        Get-ScheduledTask -TaskPath '\' -TaskName $TaskName -ErrorAction Stop
+    }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*') {
+            throw
+        }
+    }
+}
+
+function Assert-NaturalizerWatchdogDefinition {
+    param([string]$TaskName, [string]$Executable, [string]$Arguments)
+
+    [xml]$definition = Export-ScheduledTask -TaskPath '\' -TaskName $TaskName -ErrorAction Stop
+    $ns = [Xml.XmlNamespaceManager]::new($definition.NameTable)
+    $ns.AddNamespace('t', $definition.DocumentElement.NamespaceURI)
+    $actions = @($definition.SelectNodes('/t:Task/t:Actions/*', $ns))
+    if ($actions.Count -ne 1 -or $actions[0].LocalName -ne 'Exec' -or
+        $actions[0].SelectSingleNode('t:Command', $ns).InnerText -ine $Executable -or
+        $actions[0].SelectSingleNode('t:Arguments', $ns).InnerText -cne $Arguments) {
+        throw 'Saved watchdog action does not match the expected Windows PowerShell command.'
+    }
+
+    $triggers = @($definition.SelectNodes('/t:Task/t:Triggers/*', $ns))
+    $triggerNames = @($triggers | ForEach-Object { $_.LocalName } | Sort-Object)
+    if (($triggerNames -join ',') -cne 'BootTrigger,LogonTrigger' -or
+        $definition.SelectSingleNode('/t:Task/t:Triggers/*/t:Enabled[text()="false" or text()="0"]', $ns) -or
+        $definition.SelectSingleNode('/t:Task/t:Triggers/t:LogonTrigger/t:UserId', $ns)) {
+        throw 'Saved watchdog must have enabled startup and all-user logon triggers.'
+    }
+
+    $user = $definition.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:UserId', $ns)
+    $level = $definition.SelectSingleNode('/t:Task/t:Principals/t:Principal/t:RunLevel', $ns)
+    if ($user.InnerText -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18') -or
+        $level.InnerText -ne 'HighestAvailable' -or
+        $definition.SelectSingleNode('/t:Task/t:Settings/t:Enabled[text()="false" or text()="0"]', $ns)) {
+        throw 'Saved watchdog must be enabled and run as SYSTEM with highest privileges.'
+    }
+}
+
+function Install-NaturalizerWatchdog {
+    param([byte[]]$Bytes)
+
+    $taskName = 'Naturalizer_Watchdog'
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershell -PathType Leaf -ErrorAction Stop)) {
+        throw "Windows PowerShell was not found at $powershell."
+    }
+    if ($InstalledScript -notmatch '^[A-Za-z]:\\[^"]+\.ps1$') {
+        throw 'The watchdog needs an absolute path to the installed script.'
+    }
+
+    $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $expectedHash = [BitConverter]::ToString($hashAlgorithm.ComputeHash($Bytes)).Replace('-', '')
+    }
+    finally {
+        $hashAlgorithm.Dispose()
+    }
+
+    # Hold the lock through readback so two installers cannot replace each other's script.
+    $lockPath = Join-Path $InstallDirectory '.install.lock'
+    if (Test-Path -LiteralPath $lockPath -ErrorAction Stop) {
+        $lockAcl = Get-NaturalizerPathAcl -Path $lockPath
+        if (@(Get-NaturalizerUntrustedWriteRules $lockAcl).Count -gt 0) {
+            throw "Standard users have write access to $lockPath."
+        }
+    }
+    $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $staged = Join-Path $InstallDirectory "naturalizer-$runId.tmp.ps1"
+    $backup = Join-Path $InstallDirectory "naturalizer-$runId.backup.ps1"
+    $previousXml = $null
+    $registrationAttempted = $false
+    $fileChanged = $false
+    $verified = $false
+
+    try {
+        $previous = Get-NaturalizerWatchdog $taskName
+        if ($previous) {
+            $previousXml = Export-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction Stop
+        }
+
+        $installedHash = $null
+        if (Test-Path -LiteralPath $InstalledScript -ErrorAction Stop) {
+            $acl = Get-NaturalizerPathAcl -Path $InstalledScript
+            if (@(Get-NaturalizerUntrustedWriteRules $acl).Count -gt 0) {
+                throw "Standard users have write access to $InstalledScript."
+            }
+            $installedHash = (Get-FileHash -LiteralPath $InstalledScript -Algorithm SHA256 -ErrorAction Stop).Hash
+        }
+
+        if ($installedHash -ne $expectedHash) {
+            [IO.File]::WriteAllBytes($staged, $Bytes)
+            Assert-NaturalizerScriptFile -Path $staged -ExpectedHash $expectedHash
+            $tokens = $parseErrors = $null
+            [Management.Automation.Language.Parser]::ParseFile($staged, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+                throw "Staged script failed syntax validation: $($parseErrors[0].Message)"
+            }
+
+            if ($installedHash) {
+                [IO.File]::Replace($staged, $InstalledScript, $backup, $false)
+            }
+            else {
+                [IO.File]::Move($staged, $InstalledScript)
+            }
+            $fileChanged = $true
+        }
+
+        Assert-NaturalizerScriptFile -Path $InstalledScript -ExpectedHash $expectedHash
+        $fileStatus = if ($fileChanged) { 'Saved and verified' } else { 'Verified matching' }
+        Write-Log "$fileStatus script: $InstalledScript"
+
+        $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$InstalledScript`" -Watchdog"
+        $action = New-ScheduledTaskAction -Execute $powershell -Argument $arguments -ErrorAction Stop
+        $startup = New-ScheduledTaskTrigger -AtStartup -ErrorAction Stop
+        $logon = New-ScheduledTaskTrigger -AtLogon -ErrorAction Stop
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -MultipleInstances IgnoreNew -ErrorAction Stop
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest -ErrorAction Stop
+
+        $registrationAttempted = $true
+        Register-ScheduledTask -TaskPath '\' -TaskName $taskName -Action $action -Trigger @($startup, $logon) `
+            -Settings $settings -Principal $taskPrincipal -Force -ErrorAction Stop | Out-Null
+        Assert-NaturalizerWatchdogDefinition -TaskName $taskName -Executable $powershell -Arguments $arguments
+        Assert-NaturalizerScriptFile -Path $InstalledScript -ExpectedHash $expectedHash
+        $verified = $true
+    }
+    catch {
+        $installError = $_
+        $restoreFile = $true
+        if ($registrationAttempted) {
+            try {
+                if ($previousXml) {
+                    Register-ScheduledTask -TaskPath '\' -TaskName $taskName -Xml $previousXml -Force -ErrorAction Stop | Out-Null
+                }
+                elseif (Get-NaturalizerWatchdog $taskName) {
+                    Unregister-ScheduledTask -TaskPath '\' -TaskName $taskName -Confirm:$false -ErrorAction Stop
+                }
+            }
+            catch {
+                $restoreFile = $false
+                Write-Log "Could not restore the previous watchdog definition. Retained the installed file at $InstalledScript. $_" ERROR
+            }
+        }
+
+        if ($restoreFile) {
+            try {
+                if ([IO.File]::Exists($backup)) {
+                    if ([IO.File]::Exists($InstalledScript)) {
+                        [IO.File]::Replace($backup, $InstalledScript, [NullString]::Value, $false)
+                    }
+                    else {
+                        [IO.File]::Move($backup, $InstalledScript)
+                    }
+                }
+                elseif ($fileChanged) {
+                    [IO.File]::Delete($InstalledScript)
+                }
+            }
+            catch {
+                Write-Log "Could not restore the previous installed file. Backup path: $backup. $_" ERROR
+            }
+        }
+        if ([IO.File]::Exists($backup)) {
+            Write-Log "Previous script backup: $backup" WARN
+        }
+        throw $installError
+    }
+    finally {
+        try {
+            [IO.File]::Delete($staged)
+            if ($verified) {
+                [IO.File]::Delete($backup)
+            }
+        }
+        catch {
+            Write-Log "Could not remove a temporary installation file: $_" WARN
+        }
+        finally {
+            $lock.Dispose()
+        }
+    }
+
+    Write-Log "Verified registration of $taskName. Task execution can be checked in Task Scheduler or the watchdog log."
+}
+
+if (-not $Watchdog) {
+    try {
+        Write-Log 'Preparing the local script and watchdog' HEAD
+        Install-NaturalizerWatchdog -Bytes $SourceBytes
+    }
+    catch {
+        Write-Log "Watchdog setup failed for ${InstalledScript}: $_" ERROR
+        throw
+    }
+}
 
 if (-not $SkipRestorePoint -and -not $Watchdog) {
-    Write-Host "[*] Creating System Restore Point... " -NoNewline -ForegroundColor Cyan
     try {
-        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
-        Checkpoint-Computer -Description "Before Naturalizer $(Get-Date -f 'yyyy-MM-dd')" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
-        Write-Log "Restore point created." -SilentConsole
-        Write-Host "[DONE]" -ForegroundColor Green
-    } catch {
-        Write-Log "Could not create restore point (non-fatal): $_" WARN -SilentConsole
-        Write-Host "[SKIPPED/FAILED]" -ForegroundColor Yellow
+        Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
+        $description = "Before Naturalizer $runStamp ($($runId.Substring(0, 8)))"
+        Checkpoint-Computer -Description $description -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+        $point = Get-ComputerRestorePoint -ErrorAction Stop | Where-Object Description -eq $description
+        if (-not $point) {
+            throw 'Windows did not report a new restore point.'
+        }
+        Write-Log 'Restore point created.'
+    }
+    catch {
+        Write-Log "Could not create a restore point: $_" WARN
     }
 }
 
-# HELPER: SERVICES
+# Services
+
+function Get-NaturalizerService {
+    param([string]$Name)
+
+    try {
+        Get-Service -Name $Name -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Could not query service $Name. $_" WARN -SilentConsole
+    }
+}
+
+function Get-NaturalizerServiceState {
+    param($Service)
+
+    try {
+        if ($null -eq $Service.StartType -or $null -eq $Service.Status) {
+            throw 'The startup type or running state was unavailable.'
+        }
+        if ($Service.StartType -eq 'Disabled' -and $Service.Status -eq 'Stopped') {
+            return 'Disabled'
+        }
+        return 'Pending'
+    }
+    catch {
+        Write-Log "Could not read the state of $($Service.Name). $_" WARN -SilentConsole
+        return 'Unknown'
+    }
+}
+
+function Stop-NaturalizerService {
+    param($Service)
+
+    try {
+        if ($Service.Status -ne 'Stopped') {
+            Stop-Service -Name $Service.Name -Force -NoWait -ErrorAction Stop
+            $Service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(5))
+            Write-Log "Stopped service $($Service.Name)." -SilentConsole
+        }
+    }
+    catch {
+        Write-Log "Could not stop service $($Service.Name). $_" WARN
+    }
+}
 
 function Disable-NaturalizerService {
-    param([string]$Name, [string]$Why)
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) {
-        Write-Log "  [SKIP] Service not found: $Name" WARN -SilentConsole
+    param([string]$Name, [string]$Description)
+
+    $service = Get-NaturalizerService $Name
+    if ($null -eq $service -or (Get-NaturalizerServiceState $service) -ne 'Pending') {
         return
     }
-    Write-Log "  Killing: $Name  ($Why)" -SilentConsole
-    if ($svc.Status -ne 'Stopped') {
-        Stop-Service -Name $Name -Force -NoWait -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 400
+
+    if ($service.StartType -ne 'Disabled') {
+        try {
+            Set-Service -Name $Name -StartupType Disabled -ErrorAction Stop
+            $updated = Get-Service -Name $Name -ErrorAction Stop
+            if ($updated.StartType -ne 'Disabled') {
+                throw 'The service manager did not report a disabled startup type.'
+            }
+            Write-Log "Disabled service $Name ($Description)." -SilentConsole
+        }
+        catch {
+            Write-Log "Could not disable service $Name. $_" WARN
+        }
     }
-    & sc.exe config $Name start= disabled 2>&1 | Out-Null
-    & sc.exe failure $Name reset= 0 actions= "" 2>&1 | Out-Null
-    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Name"
-    if (Test-Path $regPath) {
-        Set-ItemProperty -Path $regPath -Name 'Start' -Value 4 -Type DWord -Force -ErrorAction SilentlyContinue
+
+    Stop-NaturalizerService $service
+    try {
+        Invoke-NaturalizerNative -Executable 'sc.exe' -Arguments @('failure', $Name, 'reset=', '0', 'actions=', '""') | Out-Null
+        Write-Log "Cleared recovery actions for $Name." -SilentConsole
     }
-    Write-Log "    OK $Name — stopped, disabled, recovery cleared." -SilentConsole
-}
-function Disable-UserTemplateService {
-    param([string]$Prefix)
-    # Stop active per-user instances
-    Get-Service -Name "$Prefix*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne $Prefix } | ForEach-Object {
-        Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
-        Write-Log "    OK User instance stopped: $($_.Name)" -SilentConsole
-    }
-    # Disable template registry key
-    $templateRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$Prefix"
-    if (Test-Path $templateRegPath) {
-        Set-ItemProperty -Path $templateRegPath -Name 'Start' -Value 4 -Type DWord -Force -ErrorAction SilentlyContinue
-        Write-Log "    OK Template disabled (registry): $Prefix -> Start=4" -SilentConsole
+    catch {
+        Write-Log "Could not clear recovery actions for $Name. $_" WARN -SilentConsole
     }
 }
 
-# PHASE 1 & 2 — SERVICES
-
-if (-not $Watchdog) { Write-Host "`n[*] Silently disabling pure-spy services... " -NoNewline -ForegroundColor Cyan }
-Write-Log "  -- Pure-spy services (no local function; always killed) --" -SilentConsole
+Write-Log 'Checking default services' HEAD
 Disable-NaturalizerService 'DiagTrack' 'Connected User Experiences & Telemetry'
-Disable-NaturalizerService 'dmwappushsvc' 'WAP Push / silent MDM enrollment'
+Disable-NaturalizerService 'dmwappushsvc' 'WAP Push / MDM'
 Disable-NaturalizerService 'diagsvc' 'Diagnostic Execution Service'
 Disable-NaturalizerService 'DPS' 'Diagnostic Policy Service'
 Disable-NaturalizerService 'wisvc' 'Windows Insider Service'
 Disable-NaturalizerService 'RetailDemoSvc' 'Retail Demo Service'
 Disable-NaturalizerService 'WerSvc' 'Windows Error Reporting'
 Disable-NaturalizerService 'AisSvc' 'AI Host Service'
-Disable-NaturalizerService 'PcaSvc' 'Program Compatibility Assistant Service'
-Disable-NaturalizerService 'SSDPSRV' 'SSDP Discovery / UPnP device discovery'
-if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
+Disable-NaturalizerService 'PcaSvc' 'Program Compatibility Assistant'
+Disable-NaturalizerService 'SSDPSRV' 'SSDP Discovery / UPnP'
+
 function Invoke-DualNatureGroup {
-    param($ServiceNames, $Label, $RealFunction, $BreaksIfKilled, $SpyAngle, $UserTemplatePrefix = $null)
-    if ($Watchdog) { return } # Watchdog bypasses interactive prompts
-    Write-Host "`n  ----- $Label -----" -ForegroundColor White
-    Write-Host "     Real function    : $RealFunction" -ForegroundColor Gray
-    Write-Host "     Breaks if killed : $BreaksIfKilled" -ForegroundColor Gray
-    Write-Host "     Spy angle        : $SpyAngle" -ForegroundColor DarkRed
-    $resp = (Read-Host "     Do you want to disable this service? [y/N]").Trim()
-    if ($resp -match '^[Yy]$') {
-        foreach ($svc in $ServiceNames) { Disable-NaturalizerService -Name $svc -Why $Label }
-        if ($UserTemplatePrefix) { Disable-UserTemplateService -Prefix $UserTemplatePrefix }
-        Write-Log "     -> Killed user choice." -SilentConsole
-    } else {
-        Write-Log "     -> Kept ALIVE by user choice." WARN -SilentConsole
+    param(
+        [string[]]$Services,
+        [string]$Label,
+        [string]$Description,
+        [string]$UserTemplatePrefix
+    )
+
+    if ($Watchdog) {
+        return
     }
-}
-#  DUAL-NATURE INTERACTIVE 
-Invoke-DualNatureGroup -ServiceNames @('lfsvc') -Label 'Geolocation Service' `
-    -RealFunction 'Weather app accuracy, Maps "find me," Find My Device, auto time zone.' `
-    -BreaksIfKilled 'Location apps fall back to coarse IP. Find My Device fails.' `
-    -SpyAngle 'GPS/Wi-Fi/cell-tower position logged per-app; feeds profiling.'
-Invoke-DualNatureGroup -ServiceNames @('SensorDataService','SensrSvc','SensorMonitorSvc') -Label 'Sensors (rotation / brightness)' `
-    -RealFunction 'Auto screen rotation; adaptive brightness.' `
-    -BreaksIfKilled 'Screen won''t rotate in tablet mode. Brightness won''t auto-adjust.' `
-    -SpyAngle 'Continuous ambient/usage-pattern telemetry feeding the activity profile.'
-Invoke-DualNatureGroup -ServiceNames @('WdiServiceHost','WdiSystemHost') -Label 'Diagnostic Host (WDI)' `
-    -RealFunction 'Low memory warnings; driver-crash recovery flows.' `
-    -BreaksIfKilled 'Memory warning disappears. Self-healing driver flows stop.' `
-    -SpyAngle 'Triggers on resource exhaustion / driver failure and reports upstream.'
-Invoke-DualNatureGroup -ServiceNames @('CDPSvc','CDPUserSvc') -Label 'Connected Devices / Phone Link' -UserTemplatePrefix 'CDPUserSvc' `
-    -RealFunction 'Phone Link, Nearby Share, wireless casting.' `
-    -BreaksIfKilled 'Phone Link stops entirely. Nearby Share fails.' `
-    -SpyAngle 'Cross-device activity feed uploaded to activityfeed.microsoft.com.'
-Invoke-DualNatureGroup -ServiceNames @('OneSyncSvc') -Label 'Mail / Calendar / People Sync' -UserTemplatePrefix 'OneSyncSvc' `
-    -RealFunction 'Sync engine for built-in Mail/Calendar apps (not Outlook desktop).' `
-    -BreaksIfKilled 'Built-in Mail/Calendar stop pulling new mail/events.' `
-    -SpyAngle 'Routes personal communications metadata through Microsoft sync framework.'
-Invoke-DualNatureGroup -ServiceNames @('cbdhsvc') -Label 'Clipboard History (Win+V)' -UserTemplatePrefix 'cbdhsvc' `
-    -RealFunction 'Powers the Win+V clipboard history panel.' `
-    -BreaksIfKilled 'Win+V clipboard history stops working completely.' `
-    -SpyAngle 'Offers optional cloud sync of clipboard contents via Microsoft account.'
-Invoke-DualNatureGroup -ServiceNames @('WpnService','WpnUserService') -Label 'Push Notifications' -UserTemplatePrefix 'WpnUserService' `
-    -RealFunction 'Toast notifications and Action Center badges.' `
-    -BreaksIfKilled 'All app notifications go silent.' `
-    -SpyAngle 'Maintains persistent channel to WNS and registers push token.'
-Invoke-DualNatureGroup -ServiceNames @('XblAuthManager','XblGameSave','XboxNetApiSvc') -Label 'Xbox Services' `
-    -RealFunction 'Xbox app sign-in, cloud saves, multiplayer.' `
-    -BreaksIfKilled 'Cannot sign into Xbox app. No cloud saves.' `
-    -SpyAngle 'Ties play sessions and achievements to Microsoft account profile.'
-Invoke-DualNatureGroup -ServiceNames @('MapsBroker') -Label 'Offline Maps Updater' `
-    -RealFunction 'Keeps offline map regions current.' `
-    -BreaksIfKilled 'Offline maps go stale.' `
-    -SpyAngle 'Periodic check-in for tile updates.'
-Invoke-DualNatureGroup -ServiceNames @('DoSvc') -Label 'Delivery Optimization' `
-    -RealFunction 'Shares Windows Update packages on LAN.' `
-    -BreaksIfKilled 'Updates pull directly from Microsoft CDN (no LAN shortcut).' `
-    -SpyAngle 'Can share/receive over internet (P2P) if not restricted.'
-Invoke-DualNatureGroup -ServiceNames @('EventLog') -Label 'Windows Event Log (HIGH IMPACT)' `
-    -RealFunction 'Core Windows event logging infrastructure used by Windows, applications, diagnostics, auditing, and troubleshooting.' `
-    -BreaksIfKilled 'Windows and applications can lose event logging/auditing; diagnostics and components that depend on Event Log may malfunction.' `
-    -SpyAngle 'Stores local event records that diagnostic or telemetry components may read; EventLog itself is not inherently a telemetry-upload service.'
-# ── OPTIONAL DEFENDER CLOUD PROTECTION
-if (-not $Watchdog) {
-    Write-Host "`n  ----- Microsoft Defender Cloud Protection -----" -ForegroundColor White
-    Write-Host "     Real function    : Cloud verdicts for suspicious/unknown files and Block at First Sight." -ForegroundColor Gray
-    Write-Host "     Breaks if killed : Defender keeps local protection, but loses cloud-assisted verdicts and automatic sample submission." -ForegroundColor Gray
-    Write-Host "     Privacy angle    : Defender can send security metadata and, depending on settings, file samples to Microsoft." -ForegroundColor DarkRed
-    $resp = (Read-Host "     Do you want to disable Defender cloud protection and automatic sample submission? [y/N]").Trim()
-    if ($resp -match '^[Yy]$') {
-        Write-Log " OPTIONAL — DEFENDER CLOUD PROTECTION" HEAD -SilentConsole
-        try {
-            if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
-                Set-MpPreference -MAPSReporting 0 -ErrorAction Stop
-                Set-MpPreference -SubmitSamplesConsent 2 -ErrorAction Stop
-                Set-MpPreference -DisableBlockAtFirstSeen $true -ErrorAction Stop
-                $mp = Get-MpPreference -ErrorAction SilentlyContinue
-                if ($mp) {
-                    Write-Log "  Defender cloud settings applied: MAPSReporting=$($mp.MAPSReporting), SubmitSamplesConsent=$($mp.SubmitSamplesConsent), DisableBlockAtFirstSeen=$($mp.DisableBlockAtFirstSeen)" -SilentConsole
-                } else {
-                    Write-Log "  Defender cloud settings applied." -SilentConsole
-                }
-            } else {
-                Write-Log "  [SKIP] Microsoft Defender PowerShell cmdlets are unavailable." WARN -SilentConsole
-            }
-        } catch {
-            Write-Log "  Defender cloud settings could not be changed (Tamper Protection or policy may be blocking the change): $_" WARN -SilentConsole
+
+    $pendingServices = @(foreach ($name in $Services) {
+        $service = Get-NaturalizerService $name
+        if ($null -ne $service -and (Get-NaturalizerServiceState $service) -eq 'Pending') {
+            $name
         }
-    } else {
-        Write-Log "  Defender cloud protection kept ALIVE by user choice." WARN -SilentConsole
-    }
-}
+    })
 
-# OPTIONAL SMART APP CONTROL 
-if (-not $Watchdog) {
-    Write-Host "`n  ----- Windows Smart App Control -----" -ForegroundColor White
-    Write-Host "     Real function    : Blocks untrusted, unsigned, or potentially malicious applications." -ForegroundColor Gray
-    Write-Host "     Breaks if killed : Removes Smart App Control's application execution protection." -ForegroundColor Gray
-    Write-Host "     Privacy angle    : Uses cloud-based reputation intelligence to evaluate applications." -ForegroundColor DarkRed
+    $templatePending = $false
+    $instances = @()
+    if ($UserTemplatePrefix) {
+        $templatePath = "HKLM:\SYSTEM\CurrentControlSet\Services\$UserTemplatePrefix"
+        try {
+            $start = Get-ItemPropertyValue -LiteralPath $templatePath -Name 'Start' -ErrorAction Stop
+            if ($start -isnot [int]) {
+                throw 'The template Start value was unavailable or had an unexpected type.'
+            }
+            $templatePending = $start -ne 4
+        }
+        catch {
+            Write-Log "Could not read service template $UserTemplatePrefix. $_" WARN -SilentConsole
+        }
 
-    $sacPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
-    $sacName = 'VerifiedAndReputablePolicyState'
-    $ciTool  = Join-Path $env:SystemRoot 'System32\CiTool.exe'
-
-    $sacState = Get-ItemPropertyValue -Path $sacPath `
-        -Name $sacName -ErrorAction SilentlyContinue
-
-    if ($null -eq $sacState) {
-        Write-Log "  [SKIP] Smart App Control state not found." WARN -SilentConsole
-    }
-    elseif ($sacState -eq 0) {
-        Write-Log "  Smart App Control already disabled." -SilentConsole
-    }
-    else {
-        $resp = (Read-Host "     Disable Smart App Control? [y/N]").Trim()
-
-        if ($resp -match '^[Yy]$') {
-            Write-Log " OPTIONAL — SMART APP CONTROL" HEAD -SilentConsole
-
+        # Windows uses the template for future logons. Existing instances can still be running.
+        $instances = @(foreach ($instance in @(Get-NaturalizerService "${UserTemplatePrefix}_*")) {
             try {
-                if (-not (Test-Path -LiteralPath $ciTool)) {
-                    throw "CiTool.exe is unavailable on this Windows installation."
+                if ($null -eq $instance.Status) {
+                    throw 'The running state was unavailable.'
                 }
-
-                Set-ItemProperty -Path $sacPath `
-                    -Name $sacName `
-                    -Value 0 `
-                    -Type DWord `
-                    -ErrorAction Stop
-
-                & $ciTool -r | Out-Null
-
-                if ($LASTEXITCODE -ne 0) {
-                    throw "CiTool policy refresh failed with exit code $LASTEXITCODE."
+                if ($instance.Status -ne 'Stopped') {
+                    $instance
                 }
-
-                $verified = Get-ItemPropertyValue -Path $sacPath `
-                    -Name $sacName -ErrorAction Stop
-
-                if ($verified -ne 0) {
-                    throw "Smart App Control registry verification failed."
-                }
-
-                Write-Log "  Smart App Control disabled; policy refresh completed." -SilentConsole
             }
             catch {
-                Write-Log "  Smart App Control configuration failed: $_" WARN -SilentConsole
+                Write-Log "Could not read the state of $($instance.Name). $_" WARN -SilentConsole
             }
+        })
+    }
+
+    $changes = @(foreach ($name in $pendingServices) { "stop and disable $name" })
+    if ($templatePending) {
+        $changes += "disable the $UserTemplatePrefix template"
+    }
+    $changes += @(foreach ($instance in $instances) { "stop $($instance.Name)" })
+    if ($changes.Count -eq 0) {
+        return
+    }
+
+    Write-Host "`n$Label"
+    Write-Host $Description
+    Write-Host "This will $($changes -join ', ')."
+    if ((Read-Host 'Apply these changes? [y/N]') -notmatch '^\s*y\s*$') {
+        Write-Log "Kept $Label by user choice." -SilentConsole
+        return
+    }
+
+    foreach ($name in $pendingServices) {
+        Disable-NaturalizerService -Name $name -Description $Label
+    }
+    if ($templatePending) {
+        try {
+            Set-VerifiedRegistryValue -Path $templatePath -Name 'Start' -Value 4
+            Write-Log "Disabled service template $UserTemplatePrefix." -SilentConsole
         }
-        else {
-            Write-Log "  Smart App Control preserved by user choice." -SilentConsole
+        catch {
+            Write-Log "Could not disable service template $UserTemplatePrefix. $_" WARN
         }
+    }
+    foreach ($instance in $instances) {
+        Stop-NaturalizerService $instance
     }
 }
 
-# PHASE 3 — SCHEDULED TASKS
+Invoke-DualNatureGroup -Services 'lfsvc' -Label 'Location' `
+    -Description 'Windows uses location for maps, local weather, automatic time zones, and Find My Device. Disabling the service restricts apps that use Windows location and can stop those features from working. Apps may still estimate where you are from your IP address.'
 
-if (-not $Watchdog) { Write-Host "`n[*] Disabling scheduled tasks... " -NoNewline -ForegroundColor Cyan }
-Write-Log " PHASE 3 — SCHEDULED TASKS" HEAD -SilentConsole
+Invoke-DualNatureGroup -Services @('SensorDataService', 'SensrSvc', 'SensorMonitorSvc') -Label 'Device sensors' `
+    -Description 'These services supply readings from sensors such as the accelerometer and ambient light sensor. Disabling them can stop automatic screen rotation and brightness and prevent apps from getting those readings through Windows.'
+
+Invoke-DualNatureGroup -Services @('WdiServiceHost', 'WdiSystemHost') -Label 'Windows diagnostic hosts' `
+    -Description 'Windows uses these services to run troubleshooting routines that inspect system problems. Disabling them can stop automated diagnostics and repairs. Some troubleshooting routines use information about the device and the fault.'
+
+Invoke-DualNatureGroup -Services 'CDPSvc' -UserTemplatePrefix 'CDPUserSvc' -Label 'Connected devices' `
+    -Description 'These services help Windows share activity and communicate with nearby or linked devices. Disabling them can interfere with Phone Link, nearby sharing, and casting.'
+
+Invoke-DualNatureGroup -UserTemplatePrefix 'OneSyncSvc' -Label 'Mail, calendar, and contacts sync' `
+    -Description 'Apps that use Windows account sync rely on this service to exchange mail, calendar, and contact data with your account provider. Disabling it can prevent those apps from receiving updates.'
+
+Invoke-DualNatureGroup -UserTemplatePrefix 'cbdhsvc' -Label 'Clipboard history' `
+    -Description 'This service supports clipboard history (Win+V) and optional sync across devices. Sync can send clipboard contents to your account. Disabling the service can stop history and sync.'
+
+Invoke-DualNatureGroup -Services 'WpnService' -UserTemplatePrefix 'WpnUserService' -Label 'Push notifications' `
+    -Description 'Windows uses these services to deliver app notifications, including messages from the Windows Push Notification Service. Disabling them can stop notifications and badges from updating.'
+
+Invoke-DualNatureGroup -Services @('XblAuthManager', 'XblGameSave', 'XboxNetApiSvc') -Label 'Xbox services' `
+    -Description 'Xbox services sign you in, sync game saves, and support multiplayer. Disabling them can break those features and interrupt sync with your Xbox account.'
+
+Invoke-DualNatureGroup -Services 'MapsBroker' -Label 'Offline maps' `
+    -Description 'Windows checks for and downloads updates for saved offline maps. Disabling this service stops those updates, so saved maps can become outdated.'
+
+Invoke-DualNatureGroup -Services 'DoSvc' -Label 'Delivery Optimization' `
+    -Description 'Delivery Optimization manages Windows and Microsoft Store downloads. Depending on your settings, it can exchange update data with other PCs. Disabling the service can affect updates and downloads.'
+
+# Optional security settings
+
+function Test-DefenderCloudPreferences {
+    param($Preference, [hashtable]$Desired)
+
+    $matches = $true
+    foreach ($name in $Desired.Keys) {
+        if ($null -eq $Preference -or $null -eq $Preference.PSObject.Properties[$name] -or
+            $null -eq $Preference.PSObject.Properties[$name].Value) {
+            throw "Defender did not report $name."
+        }
+        if ($Preference.PSObject.Properties[$name].Value -ne $Desired[$name]) {
+            $matches = $false
+        }
+    }
+    return $matches
+}
+
+function Invoke-DefenderCloudPrompt {
+    if ($Watchdog) {
+        return
+    }
+
+    $desired = @{ MAPSReporting = 0; SubmitSamplesConsent = 2; DisableBlockAtFirstSeen = $true }
+    if (-not (Get-Command Get-MpPreference -ErrorAction SilentlyContinue)) {
+        Write-Log 'Defender preferences are unavailable.' WARN -SilentConsole
+        return
+    }
+
+    try {
+        $preference = Get-MpPreference -ErrorAction Stop
+        if (Test-DefenderCloudPreferences $preference $desired) {
+            return
+        }
+    }
+    catch {
+        Write-Log "Could not read all Defender cloud preferences. $_" WARN
+    }
+    if (-not (Get-Command Set-MpPreference -ErrorAction SilentlyContinue)) {
+        Write-Log 'The Defender preferences cannot be changed from this session.' WARN
+        return
+    }
+
+    Write-Host "`nMicrosoft Defender cloud protection"
+    Write-Host 'Defender can send security information and file samples to Microsoft for a cloud verdict. Turning off cloud reporting, automatic sample submission, and Block at First Sight reduces cloud-assisted detection of new threats. Local antivirus is a separate setting.'
+    if ((Read-Host 'Change these Defender preferences? [y/N]') -notmatch '^\s*y\s*$') {
+        Write-Log 'Kept Defender cloud preferences by user choice.' -SilentConsole
+        return
+    }
+
+    try {
+        Set-MpPreference @desired -ErrorAction Stop
+        $preference = Get-MpPreference -ErrorAction Stop
+        if (-not (Test-DefenderCloudPreferences $preference $desired)) {
+            throw "Readback returned MAPSReporting=$($preference.MAPSReporting), SubmitSamplesConsent=$($preference.SubmitSamplesConsent), DisableBlockAtFirstSeen=$($preference.DisableBlockAtFirstSeen)."
+        }
+        Write-Log 'Verified Defender cloud preferences for reporting, sample submission, and Block at First Sight.'
+    }
+    catch {
+        Write-Log "Could not verify the requested Defender cloud preferences. $_" WARN
+    }
+}
+
+function Invoke-SmartAppControlPrompt {
+    if ($Watchdog) {
+        return
+    }
+
+    $path = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
+    $name = 'VerifiedAndReputablePolicyState'
+    try {
+        $state = Get-ItemPropertyValue -LiteralPath $path -Name $name -ErrorAction Stop
+        if ($state -isnot [int] -or $state -notin @(0, 1, 2)) {
+            throw "Unrecognized policy value '$state'."
+        }
+    }
+    catch {
+        Write-Log "Smart App Control policy is unavailable or unreadable. Skipped the change. $_" WARN -SilentConsole
+        return
+    }
+    if ($state -eq 0) {
+        return
+    }
+
+    $ciTool = Join-Path $env:SystemRoot 'System32\CiTool.exe'
+    if (-not (Test-Path -LiteralPath $ciTool -PathType Leaf)) {
+        Write-Log "Smart App Control policy is set to $state. CiTool is unavailable." WARN
+        return
+    }
+
+    Write-Host "`nWindows Smart App Control"
+    Write-Host 'Smart App Control uses signatures and cloud reputation to decide which apps can run. Turning it off removes that protection and allows apps it would otherwise block.'
+    if ((Read-Host 'Turn off Smart App Control? [y/N]') -notmatch '^\s*y\s*$') {
+        Write-Log 'Kept Smart App Control by user choice.' -SilentConsole
+        return
+    }
+
+    try {
+        Set-VerifiedRegistryValue -Path $path -Name $name -Value 0
+        Invoke-NaturalizerNative -Executable $ciTool -Arguments '-r' | Out-Null
+        if ((Get-ItemPropertyValue -LiteralPath $path -Name $name -ErrorAction Stop) -ne 0) {
+            throw 'The Smart App Control policy value changed after refresh.'
+        }
+        Write-Log 'Verified the Smart App Control policy value is Off after refresh.'
+    }
+    catch {
+        Write-Log "Could not verify the Smart App Control change. $_" WARN
+    }
+}
+
+Invoke-DefenderCloudPrompt
+Invoke-SmartAppControlPrompt
+
+# Scheduled tasks
+
 function Disable-NaturalizerTask {
     param([string]$Path, [string]$Name)
-    $task = Get-ScheduledTask -TaskPath $Path -TaskName $Name -ErrorAction SilentlyContinue
-    if ($task) {
-        Disable-ScheduledTask -TaskPath $Path -TaskName $Name -ErrorAction SilentlyContinue | Out-Null
-        Write-Log "  OK Task disabled: $Path$Name" -SilentConsole
+
+    try {
+        $task = Get-ScheduledTask -TaskPath $Path -TaskName $Name -ErrorAction Stop
+        if ($task.Settings.Enabled -eq $false) {
+            return
+        }
+        Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
+        $updated = Get-ScheduledTask -TaskPath $Path -TaskName $Name -ErrorAction Stop
+        if ($updated.Settings.Enabled -ne $false) {
+            throw 'The saved task is still enabled.'
+        }
+        Write-Log "Disabled scheduled task $Path$Name." -SilentConsole
+    }
+    catch {
+        if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*') {
+            Write-Log "Could not disable scheduled task $Path$Name. $_" WARN -SilentConsole
+        }
     }
 }
+
+Write-Log 'Checking scheduled tasks' HEAD
 $tasks = @(
     @('\Microsoft\Windows\Application Experience\', 'Microsoft Compatibility Appraiser'),
     @('\Microsoft\Windows\Application Experience\', 'Microsoft Compatibility Appraiser Exp'),
@@ -334,70 +849,86 @@ $tasks = @(
     @('\Microsoft\Windows\License Manager\', 'TempSignedLicenseExchange'),
     @('\Microsoft\Windows\WindowsAI\', 'AnalyseLocalData')
 )
-foreach ($t in $tasks) { Disable-NaturalizerTask -Path $t[0] -Name $t[1] }
-if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
+foreach ($task in $tasks) {
+    Disable-NaturalizerTask -Path $task[0] -Name $task[1]
+}
 
-# PHASE 3B — WMI / DEVICE MANAGEMENT DIAGNOSTIC SUBSCRIPTIONS
+# WMI diagnostic subscriptions
 
-if (-not $Watchdog) { Write-Host "[*] Removing diagnostic WMI subscriptions... " -NoNewline -ForegroundColor Cyan }
-Write-Log " PHASE 3B — WMI DIAGNOSTIC SUBSCRIPTIONS" HEAD -SilentConsole
-function Remove-DiagnosticWmiSubscriptions {
-    $namespace = 'root\subscription'
-    $pattern   = '(?i)(diagnos|diagtrack|telemetry|watson|windows\s*error\s*report|\bwer\b|sqm|devicecensus|dmclient|feedback|compatibility\s*appraiser|programdataupdater)'
+function Remove-NaturalizerWmiObject {
+    param($InputObject)
+
     try {
-        $filters   = @(Get-WmiObject -Namespace $namespace -Class __EventFilter -ErrorAction SilentlyContinue)
-        $consumers = @(Get-WmiObject -Namespace $namespace -Class __EventConsumer -ErrorAction SilentlyContinue)
-        $bindings  = @(Get-WmiObject -Namespace $namespace -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue)
-        $targetFilters = @($filters | Where-Object {
-            $blob = (@($_.Name, $_.Query, $_.EventNamespace) -join ' ')
-            $blob -match $pattern
-        })
-        $targetConsumers = @($consumers | Where-Object {
-            $props = $_.Properties | ForEach-Object { $_.Value }
-            $blob  = ((@($_.Name) + @($props)) -join ' ')
-            $blob -match $pattern
-        })
-        $targetPaths = @()
-        $targetPaths += @($targetFilters   | ForEach-Object { $_.__RELPATH })
-        $targetPaths += @($targetConsumers | ForEach-Object { $_.__RELPATH })
-        foreach ($binding in $bindings) {
-            $bindingText = "$($binding.Filter) $($binding.Consumer)"
-            $matchesTarget = $false
-            foreach ($path in $targetPaths) {
-                if ($path -and $bindingText -like "*$path*") { $matchesTarget = $true; break }
-            }
-            if ($matchesTarget -or $bindingText -match $pattern) {
-                Remove-WmiObject -InputObject $binding -ErrorAction SilentlyContinue
-                Write-Log "  OK WMI binding removed: $bindingText" -SilentConsole
-            }
-        }
-        foreach ($consumer in $targetConsumers) {
-            $name = $consumer.Name
-            Remove-WmiObject -InputObject $consumer -ErrorAction SilentlyContinue
-            Write-Log "  OK WMI event consumer removed: $name" -SilentConsole
-        }
-        foreach ($filter in $targetFilters) {
-            $name = $filter.Name
-            Remove-WmiObject -InputObject $filter -ErrorAction SilentlyContinue
-            Write-Log "  OK WMI event filter removed: $name" -SilentConsole
-        }
-    } catch {
-        Write-Log "  WMI diagnostic subscription cleanup failed (non-fatal): $_" WARN -SilentConsole
+        Remove-WmiObject -InputObject $InputObject -ErrorAction Stop
+        Write-Log "Removed WMI subscription object $($InputObject.__RELPATH)." -SilentConsole
+    }
+    catch {
+        Write-Log "Could not remove WMI subscription object $($InputObject.__RELPATH). $_" WARN -SilentConsole
     }
 }
+
+function Remove-DiagnosticWmiSubscriptions {
+    $namespace = 'root\subscription'
+    $pattern = '(?i)(diagnos|diagtrack|telemetry|watson|windows\s*error\s*report|\bwer\b|sqm|devicecensus|dmclient|feedback|compatibility\s*appraiser|programdataupdater)'
+
+    try {
+        $filters = @(Get-WmiObject -Namespace $namespace -Class __EventFilter -ErrorAction Stop)
+        $consumers = @(Get-WmiObject -Namespace $namespace -Class __EventConsumer -ErrorAction Stop)
+        $bindings = @(Get-WmiObject -Namespace $namespace -Class __FilterToConsumerBinding -ErrorAction Stop)
+
+        $targetFilters = @($filters | Where-Object {
+            (@($_.Name, $_.Query, $_.EventNamespace) -join ' ') -match $pattern
+        })
+        $targetConsumers = @($consumers | Where-Object {
+            $props = @($_.Properties | ForEach-Object { $_.Value })
+            ((@($_.Name) + $props) -join ' ') -match $pattern
+        })
+        $targetPaths = @(($targetFilters + $targetConsumers) | ForEach-Object { $_.__RELPATH })
+
+        # Remove bindings first so the filter and consumer objects are no longer referenced.
+        foreach ($binding in $bindings) {
+            $bindingText = "$($binding.Filter) $($binding.Consumer)"
+            $matchesTarget = $bindingText -match $pattern
+            foreach ($path in $targetPaths) {
+                if ($path -and $bindingText.IndexOf($path, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    $matchesTarget = $true
+                    break
+                }
+            }
+            if ($matchesTarget) {
+                Remove-NaturalizerWmiObject $binding
+            }
+        }
+        foreach ($object in ($targetConsumers + $targetFilters)) {
+            Remove-NaturalizerWmiObject $object
+        }
+    }
+    catch {
+        Write-Log "Could not read diagnostic WMI subscriptions. $_" WARN -SilentConsole
+    }
+}
+
+Write-Log 'Checking diagnostic WMI subscriptions' HEAD
 Remove-DiagnosticWmiSubscriptions
-if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
 
-# PHASE 4 — REGISTRY POLICIES
+# Registry policies
 
-if (-not $Watchdog) { Write-Host "[*] Applying registry policies... " -NoNewline -ForegroundColor Cyan }
-Write-Log " PHASE 4 — REGISTRY POLICIES" HEAD -SilentConsole
 function Set-Reg {
     param([string]$Path, [string]$Name, $Value, [string]$Type = 'DWord')
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null }
-    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction SilentlyContinue
-    Write-Log "  OK $Path -> $Name = $Value" -SilentConsole
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) {
+            New-Item -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        Set-VerifiedRegistryValue -Path $Path -Name $Name -Value $Value -Type $Type
+        Write-Log "Verified registry value $Path\$Name = $Value." -SilentConsole
+    }
+    catch {
+        Write-Log "Could not set registry value $Path\$Name. $_" WARN -SilentConsole
+    }
 }
+
+Write-Log 'Applying registry policies' HEAD
 Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection' 'AllowTelemetry' 0
 Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0
 Set-Reg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'MaxTelemetryAllowed' 0
@@ -456,129 +987,218 @@ Set-Reg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
 Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' 'DODownloadMode' 0
 Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
 Set-Reg 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
-if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
 
-# PHASE 5 — ETW AUTOLOGGER SESSIONS
+# ETW AutoLoggers
 
-if (-not $Watchdog) { Write-Host "[*] Disabling ETW AutoLogger sessions... " -NoNewline -ForegroundColor Cyan }
-Write-Log " PHASE 5 — ETW AUTOLOGGER SESSIONS" HEAD -SilentConsole
 function Disable-AutoLogger {
     param([string]$SessionName)
-    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\$SessionName"
-    if (Test-Path $regPath) {
-        Set-ItemProperty -Path $regPath -Name 'Start' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
-        Get-ChildItem -Path $regPath -ErrorAction SilentlyContinue | ForEach-Object {
-            Set-ItemProperty -Path $_.PSPath -Name 'Enabled' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+
+    $path = "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\Autologger\$SessionName"
+    try {
+        if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+            Write-Log "AutoLogger $SessionName is unavailable." -SilentConsole
+            return
         }
-        Write-Log "  OK AutoLogger disabled: $SessionName" -SilentConsole
+        $start = (Get-ItemProperty -LiteralPath $path -ErrorAction Stop).PSObject.Properties['Start']
+        if ($null -ne $start -and $start.Value -is [int] -and $start.Value -eq 0) {
+            Write-Log "AutoLogger $SessionName already has boot start disabled." -SilentConsole
+            return
+        }
+    }
+    catch {
+        Write-Log "Could not read AutoLogger $SessionName. $_" WARN -SilentConsole
+        return
+    }
+
+    # Start controls the next boot. Registry writes leave live tracing sessions alone.
+    try {
+        Set-VerifiedRegistryValue -Path $path -Name 'Start' -Value 0
+        Write-Log "Verified boot start disabled for AutoLogger $SessionName." -SilentConsole
+    }
+    catch {
+        Write-Log "Could not disable boot start for AutoLogger $SessionName. $_" WARN -SilentConsole
+    }
+
+    try {
+        $providers = @(Get-ChildItem -LiteralPath $path -ErrorAction Stop | Where-Object {
+            $_.PSChildName -match '^\{[a-f0-9-]{36}\}$'
+        })
+    }
+    catch {
+        Write-Log "Could not enumerate providers for AutoLogger $SessionName. $_" WARN -SilentConsole
+        return
+    }
+
+    foreach ($provider in $providers) {
+        try {
+            $enabled = (Get-ItemProperty -LiteralPath $provider.PSPath -ErrorAction Stop).PSObject.Properties['Enabled']
+            if ($null -ne $enabled -and $enabled.Value -is [int] -and $enabled.Value -eq 0) {
+                continue
+            }
+            Set-VerifiedRegistryValue -Path $provider.PSPath -Name 'Enabled' -Value 0
+            Write-Log "Verified provider $($provider.PSChildName) disabled for $SessionName." -SilentConsole
+        }
+        catch {
+            Write-Log "Could not update provider $($provider.PSChildName) for $SessionName. $_" WARN -SilentConsole
+        }
     }
 }
 
-# OPTIONAL — EXISTING WINDOWS EVENT LOG CLEARDOWN
+Write-Log 'Checking AutoLogger boot settings' HEAD
+Disable-AutoLogger 'AutoLogger-Diagtrack-Listener'
+Disable-AutoLogger 'SQMLogger'
+Disable-AutoLogger 'DiagLog'
+Disable-AutoLogger 'NOISY'
+
+# Optional cleanup
+
+function Remove-NaturalizerDiagnosticEntry {
+    param($Item)
+
+    if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Log "Skipped linked path $($Item.FullName)." WARN
+        return
+    }
+    try {
+        if ($Item.PSIsContainer) {
+            foreach ($child in @(Get-ChildItem -LiteralPath $Item.FullName -Force -ErrorAction Stop)) {
+                Remove-NaturalizerDiagnosticEntry $child
+            }
+            [IO.Directory]::Delete($Item.FullName)
+        }
+        else {
+            Remove-Item -LiteralPath $Item.FullName -Force -ErrorAction Stop
+        }
+        Write-Log "Deleted $($Item.FullName)." -SilentConsole
+    }
+    catch {
+        Write-Log "Could not delete $($Item.FullName). $_" WARN -SilentConsole
+    }
+}
 
 if (-not $Watchdog) {
-    Write-Host "`n  ----- Existing Windows Event Logs (DESTRUCTIVE) -----" -ForegroundColor White
-    Write-Host "     Targets : Existing Windows Event Viewer logs accessible through wevtutil." -ForegroundColor Gray
-    Write-Host "     Effect  : Permanently clears existing records from those logs." -ForegroundColor Gray
-    Write-Host "     WARNING : Historical troubleshooting/audit information will be lost." -ForegroundColor Red
-    Write-Host "               This operation cannot be undone without an existing backup." -ForegroundColor Red
-    $resp = (Read-Host "     Do you want to permanently clear existing Windows Event Logs? [y/N]").Trim()
-    if ($resp -match '^[Yy]$') {
-        Write-Log " OPTIONAL — WINDOWS EVENT LOG CLEARDOWN" HEAD -SilentConsole
+    Write-Host "`nClear existing Windows Event Logs"
+    Write-Host 'This permanently erases existing events, including records used for audits and troubleshooting.'
+    if ((Read-Host 'Permanently clear the Event Logs? [y/N]') -match '^\s*y\s*$') {
         try {
-            $logs = @(& wevtutil.exe el 2>$null)
+            $logs = @(Invoke-NaturalizerNative -Executable 'wevtutil.exe' -Arguments 'el')
             foreach ($log in $logs) {
                 if ([string]::IsNullOrWhiteSpace($log)) {
                     continue
                 }
                 try {
-                    & wevtutil.exe cl "$log" 2>$null
-                    if ($LASTEXITCODE -eq 0) {
-                        Write-Log "  OK Event log cleared: $log" -SilentConsole
-                    } else {
-                        Write-Log "  [SKIP/FAILED] Event log could not be cleared: $log" WARN -SilentConsole
-                    }
+                    Invoke-NaturalizerNative -Executable 'wevtutil.exe' -Arguments @('cl', $log) | Out-Null
+                    Write-Log "Cleared event log $log." -SilentConsole
                 }
                 catch {
-                    Write-Log "  [SKIP/FAILED] Event log could not be cleared: $log — $_" WARN -SilentConsole
+                    Write-Log "Could not clear event log $log. $_" WARN -SilentConsole
                 }
             }
-            Write-Log "  Windows Event Log cleardown completed." -SilentConsole
         }
         catch {
-            Write-Log "  Windows Event Log enumeration/cleardown failed: $_" WARN -SilentConsole
+            Write-Log "Could not list Windows Event Logs. $_" WARN
         }
     }
-    else {
-        Write-Log "  Existing Windows Event Logs kept by user choice." WARN -SilentConsole
-    }
-}
-Disable-AutoLogger 'AutoLogger-Diagtrack-Listener'
-Disable-AutoLogger 'SQMLogger'
-Disable-AutoLogger 'DiagLog'
-Disable-AutoLogger 'NOISY'
-if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
 
-# OPTIONAL — DIAGNOSTIC LOG PERSISTENCE CLEARDOWN
-
-if (-not $Watchdog) {
-    Write-Host "`n  ----- Existing Diagnostic Logs -----" -ForegroundColor White
-    Write-Host "     Targets          : C:\ProgramData\Microsoft\Diagnosis\ and C:\Windows\System32\wsqm\ " -ForegroundColor Gray
-    Write-Host "     Effect           : Permanently deletes existing files/subfolders stored in those two locations." -ForegroundColor Gray
-    $resp = (Read-Host "     Do you want to clear these existing diagnostic logs now? [y/N]").Trim()
-    if ($resp -match '^[Yy]$') {
-        Write-Log " OPTIONAL — DIAGNOSTIC LOG CLEARDOWN" HEAD -SilentConsole
-        $diagnosticLogPaths = @(
-            'C:\ProgramData\Microsoft\Diagnosis',
-            'C:\Windows\System32\wsqm'
-        )
-        foreach ($path in $diagnosticLogPaths) {
-            if (Test-Path -LiteralPath $path) {
-                try {
-                    Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-                    Write-Log "  OK Cleardown attempted: $path" -SilentConsole
-                } catch {
-                    Write-Log "  Cleardown failed for $path (non-fatal): $_" WARN -SilentConsole
+    Write-Host "`nDelete existing diagnostic files"
+    Write-Host 'This permanently deletes files under C:\ProgramData\Microsoft\Diagnosis and C:\Windows\System32\wsqm, including records that may help diagnose Windows problems.'
+    if ((Read-Host 'Permanently delete these diagnostic files? [y/N]') -match '^\s*y\s*$') {
+        foreach ($path in @('C:\ProgramData\Microsoft\Diagnosis', 'C:\Windows\System32\wsqm')) {
+            try {
+                if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+                    continue
                 }
-            } else {
-                Write-Log "  [SKIP] Diagnostic log path not found: $path" WARN -SilentConsole
+                $root = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+                if (-not $root.PSIsContainer -or $root.FullName -ine [IO.Path]::GetFullPath($path) -or
+                    ($root.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw "Expected a local directory at $path."
+                }
+                foreach ($item in @(Get-ChildItem -LiteralPath $root.FullName -Force -ErrorAction Stop)) {
+                    Remove-NaturalizerDiagnosticEntry $item
+                }
+            }
+            catch {
+                Write-Log "Could not clean up $path. $_" WARN
             }
         }
-    } else {
-        Write-Log "  Existing diagnostic logs kept by user choice." WARN -SilentConsole
     }
 }
 
-# PHASE 6 & 7 — FIREWALL & HOSTS
+# Optional firewall and hosts-file changes
 
 if ($BlockFirewall) {
-    if (-not $Watchdog) { Write-Host "[*] Applying Firewall outbound blocks... " -NoNewline -ForegroundColor Cyan }
-    Write-Log " PHASE 6 — FIREWALL BLOCKS" HEAD -SilentConsole
+    Write-Log 'Applying outbound firewall rules' HEAD
     $endpoints = @(
-        'v10.events.data.microsoft.com', 'v20.events.data.microsoft.com', 'eu-v20.events.data.microsoft.com',
-        'us-v20.events.data.microsoft.com', 'vortex.data.microsoft.com', 'settings-win.data.microsoft.com',
-        'watson.telemetry.microsoft.com', 'umwatson.telemetry.microsoft.com', 'oca.telemetry.microsoft.com',
-        'telemetry.microsoft.com', 'watson.microsoft.com', 'asimov-win.settings.data.microsoft.com.akadns.net',
-        'telecommand.telemetry.microsoft.com', 'data.microsoft.com'
+        'v10.events.data.microsoft.com',
+        'v20.events.data.microsoft.com',
+        'eu-v20.events.data.microsoft.com',
+        'us-v20.events.data.microsoft.com',
+        'vortex.data.microsoft.com',
+        'settings-win.data.microsoft.com',
+        'watson.telemetry.microsoft.com',
+        'umwatson.telemetry.microsoft.com',
+        'oca.telemetry.microsoft.com',
+        'telemetry.microsoft.com',
+        'watson.microsoft.com',
+        'asimov-win.settings.data.microsoft.com.akadns.net',
+        'telecommand.telemetry.microsoft.com',
+        'data.microsoft.com'
     )
-    foreach ($ep in $endpoints) {
-        $ruleName = "Naturalizer-Block-$ep"
-        Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+
+    foreach ($endpoint in $endpoints) {
+        $ruleName = "Naturalizer-Block-$endpoint"
         try {
-            New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Action Block -RemoteAddress $ep -Protocol TCP -Enabled True -Profile Any | Out-Null
-            Write-Log "  OK Firewall block: $ep" -SilentConsole
-        } catch { }
+            # RemoteAddress takes IPs. Ignore the hosts file so both options can be used together.
+            $addresses = @(Resolve-DnsName -Name $endpoint -Type A_AAAA -DnsOnly -NoHostsFile -ErrorAction Stop |
+                Where-Object { $_.Type -in @('A', 'AAAA') -and $_.IPAddress -notin @('0.0.0.0', '::') } |
+                Select-Object -ExpandProperty IPAddress -Unique)
+            if ($addresses.Count -eq 0) {
+                throw 'DNS returned no usable addresses.'
+            }
+
+            $existingRule = $null
+            try {
+                $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction Stop
+            }
+            catch {
+                if ($_.FullyQualifiedErrorId -notlike 'CmdletizationQuery_NotFound*') {
+                    throw
+                }
+            }
+            $rule = @{
+                DisplayName = $ruleName
+                Direction = 'Outbound'
+                Action = 'Block'
+                RemoteAddress = $addresses
+                Protocol = 'TCP'
+                Enabled = 'True'
+                Profile = 'Any'
+                ErrorAction = 'Stop'
+            }
+            if ($existingRule) {
+                Set-NetFirewallRule @rule
+            }
+            else {
+                New-NetFirewallRule @rule | Out-Null
+            }
+            Write-Log "Configured firewall rule $ruleName for $($addresses -join ', ')." -SilentConsole
+        }
+        catch {
+            Write-Log "Could not update firewall rule for $endpoint. $_" WARN
+        }
     }
-    if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
 }
+
 if ($BlockHosts) {
-    if (-not $Watchdog) { Write-Host "[*] Null-routing telemetry in Hosts file... " -NoNewline -ForegroundColor Cyan }
-    Write-Log " PHASE 7 — HOSTS FILE" HEAD -SilentConsole
-    $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
-    $existing  = Get-Content $hostsPath -Raw -ErrorAction SilentlyContinue
-    if ($existing -notmatch 'Naturalizer') {
-        $block = @"
-# === Naturalizer — Telemetry null-routes ======================================
+    Write-Log 'Checking the hosts file' HEAD
+    $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    try {
+        [string]$existing = if (Test-Path -LiteralPath $hostsPath -ErrorAction Stop) {
+            Get-Content -LiteralPath $hostsPath -Raw -ErrorAction Stop
+        }
+        if ($existing -notmatch '(?m)^# === Naturalizer\b') {
+            $block = @'
+# === Naturalizer - telemetry domains ===
 0.0.0.0 v10.events.data.microsoft.com
 0.0.0.0 v20.events.data.microsoft.com
 0.0.0.0 eu-v20.events.data.microsoft.com
@@ -593,35 +1213,25 @@ if ($BlockHosts) {
 0.0.0.0 telecommand.telemetry.microsoft.com
 0.0.0.0 data.microsoft.com
 0.0.0.0 asimov-win.settings.data.microsoft.com.akadns.net
-# === End Naturalizer ===========================================================
-"@
-        Add-Content -Path $hostsPath -Value $block -ErrorAction Stop
-        Write-Log "  OK Hosts file updated." -SilentConsole
-        & ipconfig /flushdns 2>&1 | Out-Null
+# === End Naturalizer ===
+'@
+            Add-Content -LiteralPath $hostsPath -Value "`r`n$block" -ErrorAction Stop
+            $written = Get-Content -LiteralPath $hostsPath -Raw -ErrorAction Stop
+            if (-not $written.Contains($block)) {
+                throw 'Could not verify the hosts-file entries.'
+            }
+            Write-Log "Verified the Naturalizer block in $hostsPath." -SilentConsole
+            Invoke-NaturalizerNative -Executable 'ipconfig.exe' -Arguments '/flushdns' | Out-Null
+        }
     }
-    if (-not $Watchdog) { Write-Host "[DONE]" -ForegroundColor Green }
-}
-
-# PHASE 8 — BOOT-START WATCHDOG SETUP (Dual-Trigger)
-
-if (-not $Watchdog) {
-    Write-Host "[*] Setting up boot-start watchdog... " -NoNewline -ForegroundColor Cyan
-    Write-Log " PHASE 8 — BOOT-START WATCHDOG" HEAD -SilentConsole
-    $TaskName = "Naturalizer_Watchdog"
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-    try {
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Watchdog"
-        # Define triggers as separate objects to avoid parser errors
-        $triggerStartup = New-ScheduledTaskTrigger -AtStartup
-        $triggerLogon   = New-ScheduledTaskTrigger -AtLogon
-        $triggers       = @($triggerStartup, $triggerLogon)
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
-        Write-Log "  OK Watchdog registered to run at startup/logon." -SilentConsole
-        Write-Host "[DONE]" -ForegroundColor Green
-    } catch {
-        Write-Log "  Failed to register Watchdog: $_" WARN -SilentConsole
-        Write-Host "[FAILED]" -ForegroundColor Red
+    catch {
+        Write-Log "Could not finish configuring the hosts file. $_" WARN
     }
 }
+
+# Task Scheduler and Event Log cleanup should finish before this optional service change.
+Invoke-DualNatureGroup -Services 'EventLog' -Label 'Windows Event Log (high impact)' `
+    -Description 'Windows and apps use this service to record events for audits and troubleshooting. Disabling it can disrupt diagnostics, dependent services, and scheduled tasks, including the watchdog. Other components can read the local events it stores.'
+
+Write-Log "Run finished. See $LogFile"
+} @args
